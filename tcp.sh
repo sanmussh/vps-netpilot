@@ -558,12 +558,15 @@ while true; do
 
     if [ -f "$SYSCTL_OPT" ]; then
         if grep -q "^net.ipv4.ip_forward = 1" "$SYSCTL_OPT" 2>/dev/null; then
-            status_sysctl="${GREEN}[中转]${NC}"
+            status_common="${GREEN}[已包含]${NC}"
+            status_transit="${GREEN}[已激活]${NC}"
         else
-            status_sysctl="${GREEN}[通用]${NC}"
+            status_common="${GREEN}[已激活]${NC}"
+            status_transit="${RED}[未开启]${NC}"
         fi
     else
-        status_sysctl="${RED}[未开启]${NC}"
+        status_common="${RED}[未开启]${NC}"
+        status_transit="${RED}[未开启]${NC}"
     fi
 
     if [ "$(sysctl -n net.core.rps_sock_flow_entries 2>/dev/null)" = "32768" ]; then
@@ -581,8 +584,8 @@ while true; do
     echo -e "${YELLOW}==================================================${NC}"
     echo -e "  1. 设置 IPv4 优先解析     $status_ipv4  解决 IPv6 绕路卡顿"
     echo -e "  2. 开启 BBR + FQ          $status_bbr  降低丢包/提升吞吐"
-    echo -e "  3. 通用保守内核调优       $status_sysctl  缓冲区/连接/conntrack"
-    echo -e "  4. 中转增强调优           $status_sysctl  通用调优 + IP 转发/MSS Clamp"
+    echo -e "  3. 通用保守内核调优       $status_common  缓冲区/连接/conntrack"
+    echo -e "  4. 中转增强调优           $status_transit  通用调优 + IP 转发/MSS Clamp"
     echo -e "  5. 网卡多核分发 (RPS)     $status_nic  消除单核 SoftIRQ 瓶颈"
     echo -e "  6. 一键回退脚本配置"
     echo -e "  7. 检查并强制同步更新脚本"
