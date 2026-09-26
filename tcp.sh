@@ -130,16 +130,28 @@ EOF
 # --------------------------------------------------
 # 3b. BBR + FQ 拥塞控制
 # --------------------------------------------------
-enable_bbr() {
-    echo -e "\n${YELLOW}>>> 正在激活 BBR + FQ 拥塞算法...${NC}"
-    save_original_values
+get_bbr_fq_state() {
+    local current_cc="${1:-$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)}"
+    local current_qdisc="${2:-$(sysctl -n net.core.default_qdisc 2>/dev/null)}"
 
-    # 检查内核是否支持 BBR
-    if ! modprobe tcp_bbr &>/dev/null && ! grep -q bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
-        print_fail "当前内核不支持 BBR，请升级到 4.9+ 内核。"
-        read -p "按回车返回..."
-        return
+    if [ "$current_cc" = "bbr" ] && [ "$current_qdisc" = "fq" ]; then
+        echo "active"
+    elif [ "$current_cc" = "bbr" ] || [ "$current_qdisc" = "fq" ]; then
+        echo "partial"
+    else
+        echo "inactive"
     fi
+}
+
+ensure_bbr_fq() {
+    # 尝试加载模块后，以内核公布的可用算法列表为准。
+    modprobe tcp_bbr &>/dev/null || true
+    modprobe sch_fq &>/dev/null || true
+    if ! grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+        return 1
+    fi
+
+    save_original_values
 
     cat > "$SYSCTL_BBR" <<'EOF'
 net.core.default_qdisc = fq
@@ -147,25 +159,37 @@ net.ipv4.tcp_congestion_control = bbr
 EOF
     sysctl --system &>/dev/null
 
-    # 验证是否生效
-    local current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
-    local current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+    local current_cc
+    local current_qdisc
+    current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
 
     if [ "$current_cc" = "bbr" ] && [ "$current_qdisc" = "fq" ]; then
-        print_ok "BBR + FQ 已成功激活。"
-    else
-        print_warn "设置已写入但可能未完全生效，当前状态: cc=$current_cc qdisc=$current_qdisc"
+        return 0
     fi
 
-    # 检测实际 BBR 版本
-    local kernel_ver=$(uname -r | cut -d. -f1-2)
-    local major=$(echo "$kernel_ver" | cut -d. -f1)
-    local minor=$(echo "$kernel_ver" | cut -d. -f2)
-    if [ "$major" -gt 6 ] || ([ "$major" -eq 6 ] && [ "$minor" -ge 12 ]); then
-        print_info "内核版本 $(uname -r) >= 6.12，当前运行的是 ${GREEN}BBRv3${NC}。"
+    return 2
+}
+
+enable_bbr() {
+    echo -e "\n${YELLOW}>>> 正在激活 BBR + FQ 拥塞算法...${NC}"
+
+    ensure_bbr_fq
+    local bbr_result=$?
+    local current_cc
+    local current_qdisc
+    current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+
+    if [ "$bbr_result" -eq 0 ]; then
+        print_ok "BBR + FQ 已成功激活。"
+    elif [ "$bbr_result" -eq 1 ]; then
+        print_fail "当前内核未提供 BBR，请先升级到支持 BBR 的系统内核。"
     else
-        print_info "内核版本 $(uname -r)，当前运行的是 ${CYAN}BBRv1/v2${NC}。升级到 6.12+ 可获得 BBRv3。"
+        print_warn "配置已写入但未完全生效，当前状态: cc=${current_cc:-未知} qdisc=${current_qdisc:-未知}"
     fi
+
+    print_info "当前内核: $(uname -r)；BBR 实现版本由系统内核提供，脚本不根据内核版本号推测。"
 
     draw_line
     printf "  %-26s : ${GREEN}%s${NC}\n" "Congestion Control" "$current_cc"
@@ -247,6 +271,8 @@ smart_tune() {
     local mode="${1:-common}"
     local enable_forward=0
     local mode_name="通用保守调优"
+    local old_cc
+    old_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
 
     if [ "$mode" = "transit" ]; then
         enable_forward=1
@@ -254,7 +280,25 @@ smart_tune() {
     fi
 
     echo -e "\n${YELLOW}>>> 正在启动系统环境扫描...${NC}"
-    save_original_values
+    echo -e "${YELLOW}>>> 正在检查并激活 BBR + FQ...${NC}"
+    ensure_bbr_fq
+    local bbr_result=$?
+    if [ "$bbr_result" -eq 1 ]; then
+        print_fail "当前内核未提供 BBR，本次调优未执行。"
+        print_info "请先升级到支持 BBR 的系统内核，再重新运行选项 3 或 4。"
+        read -p "按回车返回..."
+        return
+    elif [ "$bbr_result" -ne 0 ]; then
+        local current_cc
+        local current_qdisc
+        current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+        current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+        print_fail "BBR + FQ 未完全生效，本次调优未执行。"
+        print_info "当前状态: cc=${current_cc:-未知} qdisc=${current_qdisc:-未知}"
+        read -p "按回车返回..."
+        return
+    fi
+    print_ok "BBR + FQ 已激活，继续执行${mode_name}。"
 
     local mem_total_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
     local cpu_count=$(nproc)
@@ -279,7 +323,6 @@ smart_tune() {
     [ "$conntrack_max" -lt 65536 ] && conntrack_max=65536
 
     # 保存优化前的旧值用于对比
-    local old_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
     local old_somax=$(sysctl -n net.core.somaxconn 2>/dev/null || echo "128")
     local old_rmem=$(sysctl -n net.core.rmem_max 2>/dev/null || echo "212992")
     local old_file=$(ulimit -n)
@@ -294,10 +337,6 @@ smart_tune() {
     cat > "$SYSCTL_OPT" <<EOF
 # ===== TCP/UDP 网络性能调优 =====
 # 由 tcp.sh 自动生成，勿手动编辑
-
-# --- BBR + FQ ---
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
 
 # --- 连接队列与端口 ---
 net.core.somaxconn = 65535
@@ -391,7 +430,9 @@ EOF
     # 输出对比结果
     echo -e "\n${GREEN}✅ 内核调优完成，配置变更对比:${NC}"
     draw_line
-    printf "  %-14s: %-15s -> ${GREEN}%-15s${NC}\n" "拥塞算法" "$old_cc" "bbr"
+    local new_cc
+    new_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
+    printf "  %-14s: %-15s -> ${GREEN}%-15s${NC}\n" "拥塞算法" "$old_cc" "$new_cc"
     printf "  %-14s: %-15s -> ${GREEN}%-15s${NC}\n" "最大连接队列" "$old_somax" "65535"
     printf "  %-14s: %-15s -> ${GREEN}%-15s${NC}\n" "文件句柄" "$old_file" "1048576"
     printf "  %-14s: %-15s -> ${GREEN}%-15s${NC}\n" "网络缓冲" "$((old_rmem / 1024 / 1024))MB" "$((buf_bytes / 1024 / 1024))MB"
@@ -544,17 +585,20 @@ rollback_all() {
 # ==================================================
 while true; do
     # --- 实时状态检测 ---
+    cur_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    cur_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+
     if [ -f /etc/gai.conf ] && grep -q "^precedence ::ffff:0:0/96  100" /etc/gai.conf 2>/dev/null; then
         status_ipv4="${GREEN}[已激活]${NC}"
     else
         status_ipv4="${RED}[未开启]${NC}"
     fi
 
-    if [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" = "bbr" ]; then
-        status_bbr="${GREEN}[已激活]${NC}"
-    else
-        status_bbr="${RED}[未开启]${NC}"
-    fi
+    case "$(get_bbr_fq_state "$cur_cc" "$cur_qdisc")" in
+        active) status_bbr="${GREEN}[已激活]${NC}" ;;
+        partial) status_bbr="${YELLOW}[部分启用]${NC}" ;;
+        *) status_bbr="${RED}[未开启]${NC}" ;;
+    esac
 
     if [ -f "$SYSCTL_OPT" ]; then
         if grep -q "^net.ipv4.ip_forward = 1" "$SYSCTL_OPT" 2>/dev/null; then
@@ -592,8 +636,6 @@ while true; do
     echo -e "  8. 彻底卸载面板脚本"
     echo -e "  0. 退出脚本"
     draw_line
-    cur_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
-    cur_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
     cur_fd=$(ulimit -n)
     cur_fwd=$(sysctl -n net.ipv4.ip_forward 2>/dev/null)
     echo -e "  算法: ${GREEN}${cur_cc}${NC} | 队列: ${GREEN}${cur_qdisc}${NC} | 句柄: ${GREEN}${cur_fd}${NC} | 转发: ${GREEN}${cur_fwd}${NC}"
