@@ -5,6 +5,9 @@
 # ==================================================
 SCRIPT_PATH="/usr/local/bin/tcp.sh"
 SHORTCUT_PATH="/usr/local/bin/t"
+SCRIPT_URL="https://raw.githubusercontent.com/sanmussh/vps-netpilot/main/tcp.sh"
+umask 022
+set -o pipefail
 
 if [ "$EUID" -ne 0 ]; then
     echo -e "\033[0;31m错误: 必须使用 root 权限运行此脚本！\033[0m"
@@ -31,18 +34,34 @@ print_warn() { echo -e "  ${YELLOW}⚠${NC} $1"; }
 print_fail() { echo -e "  ${RED}✘${NC} $1"; }
 print_info() { echo -e "  ${CYAN}ℹ${NC} $1"; }
 
+download_script() {
+    local tmp
+    command -v curl >/dev/null || { print_fail "请先安装 curl。"; return 1; }
+    tmp=$(mktemp "${SCRIPT_PATH}.XXXXXX") || return 1
+    if ! curl -fSL --connect-timeout 10 --max-time 90 --retry 2 "$SCRIPT_URL" -o "$tmp" ||
+       ! head -n 1 "$tmp" | grep -Eq '^#!/(bin/bash|usr/bin/env bash)$' ||
+       ! grep -q 'VPS NetPilot' "$tmp" || ! bash -n "$tmp"; then
+        rm -f -- "$tmp"
+        print_fail "下载或脚本校验失败，原脚本未替换。"
+        return 1
+    fi
+    if ! chmod 755 "$tmp" || ! mv -f -- "$tmp" "$SCRIPT_PATH"; then
+        rm -f -- "$tmp"
+        print_fail "脚本写入失败。"
+        return 1
+    fi
+}
+
 # ==================================================
 # --- 1. 自动安装与快捷键设置 ---
 # ==================================================
-if [ "$_" != "$SCRIPT_PATH" ] && [ "$0" != "$SCRIPT_PATH" ]; then
+if [ "$(readlink -f -- "$0" 2>/dev/null)" != "$SCRIPT_PATH" ]; then
     echo -e "${YELLOW}>>> 正在安装脚本到本地系统...${NC}"
-    mkdir -p /usr/local/bin
-
-    curl -sL "https://raw.githubusercontent.com/sanmussh/vps-netpilot/main/tcp.sh" -o "$SCRIPT_PATH"
-    chmod +x "$SCRIPT_PATH"
+    mkdir -p /usr/local/bin || exit 1
+    download_script || exit 1
 
     if [ ! -f "$SHORTCUT_PATH" ] || [ ! -L "$SHORTCUT_PATH" ]; then
-        ln -sf "$SCRIPT_PATH" "$SHORTCUT_PATH"
+        ln -sf "$SCRIPT_PATH" "$SHORTCUT_PATH" || exit 1
         echo -e "${GREEN}✅ 快捷命令 't' 已创建，以后在任意地方输入 t 即可打开面板。${NC}"
     fi
 
@@ -55,16 +74,10 @@ fi
 # ==================================================
 check_update() {
     printf "${YELLOW}正在同步最新脚本...${NC}\n"
-    curl -sL "https://raw.githubusercontent.com/sanmussh/vps-netpilot/main/tcp.sh" -o "$SCRIPT_PATH.tmp"
-    if [ $? -eq 0 ] && [ -s "$SCRIPT_PATH.tmp" ]; then
-        mv "$SCRIPT_PATH.tmp" "$SCRIPT_PATH"
-        chmod +x "$SCRIPT_PATH"
+    if download_script; then
         printf "${GREEN}脚本更新成功！正在重新载入...${NC}\n"
-        sleep 1
+        exec 9>&-
         exec bash "$SCRIPT_PATH"
-    else
-        rm -f "$SCRIPT_PATH.tmp"
-        printf "${RED}更新失败，请检查网络。${NC}\n"
     fi
 }
 
@@ -73,9 +86,11 @@ uninstall_script() {
     read -p "确定要卸载吗？(这也会同时回退所有网络优化设置) [y/N]: " confirm
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
         echo -e "${YELLOW}正在回退脚本写入的网络配置...${NC}"
-        rollback_all &>/dev/null
-        rm -f "$SHORTCUT_PATH"
-        rm -f "$SCRIPT_PATH"
+        if ! rollback_all; then
+            print_fail "回退尚未完成，保留脚本和快照，请先处理上面的失败项。"
+            return 1
+        fi
+        rm -f "$SHORTCUT_PATH" "$SCRIPT_PATH" || return 1
         echo -e "${GREEN}✅ 卸载成功！网络已恢复，脚本与快捷键 't' 已从系统中移除。${NC}\n"
         exit 0
     else
@@ -92,49 +107,248 @@ SYSCTL_BBR="/etc/sysctl.d/10-bbr.conf"
 LIMITS_OPT="/etc/security/limits.d/99-network-performance.conf"
 STATE_DIR="/var/lib/tcp-opt"
 STATE_FILE="$STATE_DIR/original-values"
+GAI_FILE="/etc/gai.conf"
+NET_CLASS_DIR="/sys/class/net"
+MSS_TAG="vps-netpilot"
+
+# 同目录临时文件保证替换原子性；写入失败时保留原文件。
+atomic_write() {
+    local target="$1" mode="${2:-600}" tmp
+    [ ! -L "$target" ] || { print_fail "拒绝覆盖符号链接: $target" >&2; return 1; }
+    tmp=$(mktemp "${target}.XXXXXX") || return 1
+    if ! cat > "$tmp" || ! chmod "$mode" "$tmp" || ! mv -f -- "$tmp" "$target"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+}
+
+ensure_state() {
+    [ "${STATE_READY:-0}" = 1 ] && return 0
+    mkdir -p "$STATE_DIR/files" || return 1
+    chmod 700 "$STATE_DIR" "$STATE_DIR/files" || return 1
+    if { [ -f "$STATE_FILE" ] && ! grep -qx '# vps-netpilot-state-v2' "$STATE_FILE"; } ||
+       { [ ! -f "$STATE_FILE" ] && [ -f "$SYSCTL_OPT" ]; }; then
+        printf '%s\n' '旧版未记录完整原值；补充快照仅代表升级时的状态。' |
+            atomic_write "$STATE_DIR/legacy-incomplete" || return 1
+    fi
+    if [ ! -f "$STATE_FILE" ] || ! grep -qx '# vps-netpilot-state-v2' "$STATE_FILE"; then
+        local tmp
+        tmp=$(mktemp "${STATE_FILE}.XXXXXX") || return 1
+        if ! printf '# vps-netpilot-state-v2\n' > "$tmp"; then rm -f -- "$tmp"; return 1; fi
+        if [ -f "$STATE_FILE" ]; then
+            if ! awk -F= '
+                    $1=="tcp_congestion_control" {$1="net.ipv4.tcp_congestion_control"}
+                    $1=="default_qdisc" {$1="net.core.default_qdisc"}
+                    $1=="ip_forward" {$1="net.ipv4.ip_forward"}
+                    $1=="ipv6_forwarding" {$1="net.ipv6.conf.all.forwarding"}
+                    /^net\./ {print $1 "=" $2}
+                ' "$STATE_FILE" >> "$tmp"; then rm -f -- "$tmp"; return 1; fi
+        fi
+        if ! chmod 600 "$tmp" || ! mv -f -- "$tmp" "$STATE_FILE"; then
+            rm -f -- "$tmp"; return 1
+        fi
+    fi
+    if [ -f "$STATE_DIR/legacy-incomplete" ]; then
+        print_warn "旧版快照不完整：已知原值保留，其余仅能恢复到升级时的状态。"
+    fi
+    STATE_READY=1
+}
+
+snapshot_value() {
+    local key="$1" value="$2" tmp
+    ensure_state || return 1
+    if awk -F= -v k="$key" '$1==k {found=1} END {exit !found}' "$STATE_FILE"; then
+        return 0
+    fi
+    tmp=$(mktemp "${STATE_FILE}.XXXXXX") || return 1
+    if ! cp -- "$STATE_FILE" "$tmp" || ! printf '%s=%s\n' "$key" "$value" >> "$tmp" ||
+       ! chmod 600 "$tmp" || ! mv -f -- "$tmp" "$STATE_FILE"; then
+        rm -f -- "$tmp"; return 1
+    fi
+}
+
+get_state_value() {
+    local key="$1"
+    [ -f "$STATE_FILE" ] || return 1
+    awk -F= -v k="$key" '$1==k {print substr($0,index($0,"=")+1); found=1; exit}
+        END {exit !found}' "$STATE_FILE"
+}
+
+backup_managed_file() {
+    local target="$1" id="$2" kind
+    ensure_state || return 1
+    kind="$STATE_DIR/files/$id.kind"
+    [ -f "$kind" ] && return 0
+    [ ! -L "$target" ] || { print_fail "拒绝修改符号链接: $target"; return 1; }
+    # 旧版生成文件应在回退时删除，不能把它们当作调优前的配置恢复。
+    if [ -f "$STATE_DIR/legacy-incomplete" ] && [[ "$id" =~ ^(bbr|opt|limits)$ ]]; then
+        printf 'absent\n' | atomic_write "$kind"
+    elif [ -e "$target" ]; then
+        local tmp
+        tmp=$(mktemp "$STATE_DIR/files/$id.XXXXXX") || return 1
+        if ! cp -p -- "$target" "$tmp" || ! mv -f -- "$tmp" "$STATE_DIR/files/$id.original"; then
+            rm -f -- "$tmp"; return 1
+        fi
+        printf 'present\n' | atomic_write "$kind"
+    else
+        printf 'absent\n' | atomic_write "$kind"
+    fi
+}
+
+restore_managed_file() {
+    local target="$1" id="$2" kind="$STATE_DIR/files/$2.kind" tmp
+    [ -f "$kind" ] || return 0
+    case "$(cat "$kind")" in
+        absent) rm -f -- "$target" ;;
+        present)
+            [ ! -L "$target" ] || return 1
+            tmp=$(mktemp "${target}.XXXXXX") || return 1
+            if ! cp -p -- "$STATE_DIR/files/$id.original" "$tmp" || ! mv -f -- "$tmp" "$target"; then
+                rm -f -- "$tmp"; return 1
+            fi ;;
+        *) return 1 ;;
+    esac
+}
+
+normalize_value() { awk '{$1=$1; print}'; }
+
+restore_sysctl_values() {
+    local file="$1" key value actual failed=0
+    while IFS='=' read -r key value; do
+        [[ "$key" == net.* ]] || continue
+        actual=$(sysctl -n "$key" 2>/dev/null | normalize_value)
+        [ "$actual" != "$(printf '%s\n' "$value" | normalize_value)" ] || continue
+        if ! sysctl -q -w "$key=$value" 2>/dev/null; then
+            print_warn "未能恢复 $key"; failed=1; continue
+        fi
+        actual=$(sysctl -n "$key" 2>/dev/null | normalize_value)
+        if [ "$actual" != "$(printf '%s\n' "$value" | normalize_value)" ]; then
+            print_warn "恢复后读回不一致: $key"; failed=1
+        fi
+    done < "$file"
+    return "$failed"
+}
+
+# 仅应用本脚本的参数；失败项不持久化，提交失败则恢复本次调用前的值。
+# 返回值: 0 全部成功，2 部分参数被拒绝，1 文件/快照错误。
+apply_sysctl_config() {
+    local source="$1" target="$2" id="$3" strict="${4:-0}"
+    local output journal line key value before actual rejected=0 failed=0
+    [ -s "$source" ] && [ -r "$source" ] || return 1
+    backup_managed_file "$target" "$id" || return 1
+    output=$(mktemp "${target}.XXXXXX") || return 1
+    journal=$(mktemp "$STATE_DIR/apply.XXXXXX") || { rm -f -- "$output"; return 1; }
+    while IFS= read -r line || [ -n "$line" ]; do
+        if [[ "$line" =~ ^[[:space:]]*(#|$) ]]; then
+            printf '%s\n' "$line" >> "$output" || { failed=1; break; }
+            continue
+        fi
+        key="${line%%=*}"; key="${key//[[:space:]]/}"
+        value=$(printf '%s\n' "${line#*=}" | normalize_value)
+        if [[ ! "$key" =~ ^net\.[a-zA-Z0-9_.]+$ ]] || [[ "$line" != *=* ]]; then
+            print_fail "无效参数行: $line"; failed=1; break
+        fi
+        if ! before=$(sysctl -n "$key" 2>/dev/null); then
+            print_warn "跳过不可读取的参数: $key"
+            printf '# skipped: %s\n' "$line" >> "$output" || { failed=1; break; }
+            rejected=$((rejected + 1)); continue
+        fi
+        if ! snapshot_value "$key" "$before" || ! printf '%s=%s\n' "$key" "$before" >> "$journal"; then
+            failed=1; break
+        fi
+        if sysctl -q -w "$key=$value" 2>/dev/null &&
+           actual=$(sysctl -n "$key" 2>/dev/null | normalize_value) && [ "$actual" = "$value" ]; then
+            printf '%s = %s\n' "$key" "$value" >> "$output" || { failed=1; break; }
+        else
+            print_warn "内核拒绝或读回不一致: $key = $value"
+            actual=$(sysctl -n "$key" 2>/dev/null | normalize_value)
+            if [ "$actual" != "$(printf '%s\n' "$before" | normalize_value)" ]; then
+                if ! sysctl -q -w "$key=$before" 2>/dev/null ||
+                   [ "$(sysctl -n "$key" 2>/dev/null | normalize_value)" != "$(printf '%s\n' "$before" | normalize_value)" ]; then
+                    print_warn "无法恢复本次尝试前的值: $key"; failed=1; break
+                fi
+            fi
+            printf '# rejected: %s\n' "$line" >> "$output" || { failed=1; break; }
+            rejected=$((rejected + 1))
+        fi
+    done < "$source"
+    if [ "$strict" = 1 ] && [ "$rejected" -gt 0 ]; then failed=1; fi
+    if [ "$failed" = 0 ]; then
+        chmod 644 "$output" && mv -f -- "$output" "$target" || failed=1
+    fi
+    if [ "$failed" != 0 ]; then
+        restore_sysctl_values "$journal" || print_warn "本次参数未完全恢复，请使用选项 6 重试。"
+        rm -f -- "$output" "$journal"
+        return 1
+    fi
+    rm -f -- "$journal"
+    [ "$rejected" -eq 0 ] || return 2
+}
 
 # --------------------------------------------------
 # 3a. IPv4 优先解析
 # --------------------------------------------------
 set_ipv4_priority() {
     echo -e "\n${YELLOW}>>> 正在调整系统互联网协议优先级...${NC}"
-
-    # 如果 gai.conf 不存在，创建标准模板
-    if [ ! -f /etc/gai.conf ]; then
-        cat > /etc/gai.conf <<'EOF'
-label ::1/128       0
-label ::/0          1
-label 2002::/16     2
-label ::/96         3
-label ::ffff:0:0/96 4
-precedence  ::1/128       50
-precedence  ::/0          40
-precedence  2002::/16     30
-precedence  ::/96         20
-precedence  ::ffff:0:0/96 10
-EOF
+    backup_managed_file "$GAI_FILE" gai || return 1
+    local tmp
+    tmp=$(mktemp "${GAI_FILE}.XXXXXX") || return 1
+    if [ -f "$GAI_FILE" ]; then
+        if ! sed '/^[[:space:]]*precedence[[:space:]]*::ffff:0:0\/96[[:space:]]/d' "$GAI_FILE" > "$tmp"; then
+            rm -f -- "$tmp"; return 1
+        fi
     fi
-
-    # 备份（只在第一次时创建）
-    [ ! -f /etc/gai.conf.bak ] && cp /etc/gai.conf /etc/gai.conf.bak
-
-    # 先删除所有相关行（不管有没有 #），再追加正确的行。幂等操作。
-    sed -i '/precedence ::ffff:0:0\/96/d' /etc/gai.conf
-    echo "precedence ::ffff:0:0/96  100" >> /etc/gai.conf
-
-    print_ok "系统已设置为 ${GREEN}IPv4 优先${NC}，DNS 解析将优先返回 A 记录。"
-    print_info "这能避免 IPv6 默认路由绕路导致的握手卡顿。"
+    if ! printf '\nprecedence ::ffff:0:0/96  100\n' >> "$tmp" ||
+       ! chmod 644 "$tmp" || ! mv -f -- "$tmp" "$GAI_FILE"; then
+        rm -f -- "$tmp"; print_fail "IPv4 优先配置写入失败。"; return 1
+    fi
+    print_ok "已调整使用 glibc 地址选择规则的应用的 IPv4 优先级。"
     read -p "按回车返回..."
 }
 
 # --------------------------------------------------
 # 3b. BBR + FQ 拥塞控制
 # --------------------------------------------------
-get_bbr_fq_state() {
-    local current_cc="${1:-$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)}"
-    local current_qdisc="${2:-$(sysctl -n net.core.default_qdisc 2>/dev/null)}"
+get_actual_fq_state() {
+    local interfaces iface output state unknown=0
+    command -v ip >/dev/null && command -v tc >/dev/null || { echo unknown; return; }
+    interfaces=$({ ip -o -4 route show default; ip -o -6 route show default; } 2>/dev/null |
+        awk '{for(i=1;i<NF;i++) if($i=="dev") print $(i+1)}' | sort -u)
+    [ -n "$interfaces" ] || { echo unknown; return; }
+    for iface in $interfaces; do
+        if ! output=$(tc qdisc show dev "$iface" 2>/dev/null); then unknown=1; continue; fi
+        state=$(printf '%s\n' "$output" | awk '
+            $1=="qdisc" {
+                for(i=1;i<=NF;i++) if($i=="root") {root=$2; handle=$3}
+                for(i=1;i<NF;i++) if($i=="parent") {parent[++n]=$(i+1); kind[n]=$2}
+            }
+            END {
+                if(root=="fq") {print "fq"; exit}
+                if(root=="mq") {
+                    sub(/:$/, "", handle)
+                    for(j=1;j<=n;j++) {
+                        split(parent[j],p,":")
+                        if(p[1]==handle || (handle=="0" && p[1]=="")) {
+                            leaves++; if(kind[j]!="fq") bad=1
+                        }
+                    }
+                    if(leaves && !bad) {print "fq"; exit}
+                }
+                print (root=="" ? "unknown" : "other")
+            }')
+        [ "$state" != other ] || { echo other; return; }
+        [ "$state" != unknown ] || unknown=1
+    done
+    if [ "$unknown" = 1 ]; then echo unknown; else echo fq; fi
+}
 
-    if [ "$current_cc" = "bbr" ] && [ "$current_qdisc" = "fq" ]; then
+get_bbr_fq_state() {
+    local current_cc="${1-$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)}"
+    local current_qdisc="${2-$(sysctl -n net.core.default_qdisc 2>/dev/null)}"
+    local actual="${3-$(get_actual_fq_state)}"
+    if [ -z "$current_cc" ] || [ -z "$current_qdisc" ]; then
+        echo unknown
+    elif [ "$current_cc" = bbr ] && [ "$current_qdisc" = fq ] && [ "$actual" = fq ]; then
         echo "active"
     elif [ "$current_cc" = "bbr" ] || [ "$current_qdisc" = "fq" ]; then
         echo "partial"
@@ -147,28 +361,26 @@ ensure_bbr_fq() {
     # 尝试加载模块后，以内核公布的可用算法列表为准。
     modprobe tcp_bbr &>/dev/null || true
     modprobe sch_fq &>/dev/null || true
-    if ! grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+    if ! sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
         return 1
     fi
-
-    save_original_values
-
-    cat > "$SYSCTL_BBR" <<'EOF'
+    ensure_state || return 2
+    local source result
+    source=$(mktemp "$STATE_DIR/bbr.XXXXXX") || return 2
+    if ! cat > "$source" <<'EOF'
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 EOF
-    sysctl --system &>/dev/null
-
-    local current_cc
-    local current_qdisc
-    current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
-    current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
-
-    if [ "$current_cc" = "bbr" ] && [ "$current_qdisc" = "fq" ]; then
-        return 0
+    then
+        rm -f -- "$source"; return 2
     fi
-
-    return 2
+    apply_sysctl_config "$source" "$SYSCTL_BBR" bbr 1
+    result=$?
+    rm -f -- "$source"
+    [ "$result" = 0 ] || return 2
+    # 默认值不会替换现有 qdisc；这里只检查，不覆盖用户的队列/整形规则。
+    [ "$(get_actual_fq_state)" = fq ] || return 3
+    return 0
 }
 
 enable_bbr() {
@@ -185,57 +397,61 @@ enable_bbr() {
         print_ok "BBR + FQ 已成功激活。"
     elif [ "$bbr_result" -eq 1 ]; then
         print_fail "当前内核未提供 BBR，请先升级到支持 BBR 的系统内核。"
+    elif [ "$bbr_result" -eq 3 ]; then
+        print_warn "BBR 与默认 FQ 已设置，实际出口队列未全部验证为 FQ，原队列保持不变。"
     else
-        print_warn "配置已写入但未完全生效，当前状态: cc=${current_cc:-未知} qdisc=${current_qdisc:-未知}"
+        print_fail "配置或校验失败，当前状态: cc=${current_cc:-未知} default_qdisc=${current_qdisc:-未知}"
     fi
 
     print_info "当前内核: $(uname -r)；BBR 实现版本由系统内核提供，脚本不根据内核版本号推测。"
 
     draw_line
     printf "  %-26s : ${GREEN}%s${NC}\n" "Congestion Control" "$current_cc"
-    printf "  %-26s : ${GREEN}%s${NC}\n" "Packet Scheduler (qdisc)" "$current_qdisc"
+    printf "  %-26s : %s\n" "Default qdisc" "$current_qdisc"
+    printf "  %-26s : %s\n" "Actual egress FQ" "$(get_actual_fq_state)"
     draw_line
 
     read -p "按回车返回..."
 }
 
-save_original_values() {
-    mkdir -p "$STATE_DIR"
-    [ -f "$STATE_FILE" ] && return
-
-    {
-        printf 'tcp_congestion_control=%s\n' "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo cubic)"
-        printf 'default_qdisc=%s\n' "$(sysctl -n net.core.default_qdisc 2>/dev/null || echo fq_codel)"
-        printf 'ip_forward=%s\n' "$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo 0)"
-        printf 'ipv6_forwarding=%s\n' "$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null || echo 0)"
-    } > "$STATE_FILE"
-}
-
-get_state_value() {
-    local key="$1"
-    local fallback="$2"
-    if [ -f "$STATE_FILE" ]; then
-        awk -F= -v key="$key" '$1 == key {print $2; found=1} END {exit !found}' "$STATE_FILE" 2>/dev/null || echo "$fallback"
-    else
-        echo "$fallback"
-    fi
-}
-
 add_mss_clamp_rule() {
-    command -v iptables &>/dev/null || return
-    if iptables -t mangle -C POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; then
-        print_info "MSS Clamp 规则已存在，跳过重复添加。"
-    else
-        iptables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
-        print_ok "MSS Clamp 规则已部署 (防止跨境 MTU 超限丢包)"
+    command -v iptables &>/dev/null || { print_warn "未安装 iptables，MSS Clamp 未设置。"; return 1; }
+    local -a rule=(-p tcp --tcp-flags SYN,RST SYN -m comment --comment "$MSS_TAG" -j TCPMSS --clamp-mss-to-pmtu)
+    if iptables -t mangle -C POSTROUTING "${rule[@]}" 2>/dev/null; then
+        return 0
     fi
+    if iptables -t mangle -C POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; then
+        print_info "已有未标记的 MSS Clamp 规则，保留并复用；回退不会删除它。"
+        return 0
+    fi
+    ensure_state || return 1
+    printf 'owned\n' | atomic_write "$STATE_DIR/mss-owned" || return 1
+    if ! iptables -t mangle -A POSTROUTING "${rule[@]}" ||
+       ! iptables -t mangle -C POSTROUTING "${rule[@]}"; then
+        print_warn "MSS Clamp 添加或验证失败。"; return 1
+    fi
+    print_ok "已添加带脚本标记的 MSS Clamp 规则（当前运行期有效）。"
+}
+
+mss_clamp_present() {
+    command -v iptables >/dev/null || return 1
+    iptables -t mangle -C POSTROUTING -p tcp --tcp-flags SYN,RST SYN -m comment --comment "$MSS_TAG" -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null ||
+        iptables -t mangle -C POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
 }
 
 remove_mss_clamp_rules() {
-    command -v iptables &>/dev/null || return
-    while iptables -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; do
-        true
+    [ -f "$STATE_DIR/mss-owned" ] || return 0
+    command -v iptables &>/dev/null || return 1
+    local -a rule=(-p tcp --tcp-flags SYN,RST SYN -m comment --comment "$MSS_TAG" -j TCPMSS --clamp-mss-to-pmtu)
+    local result
+    while true; do
+        iptables -t mangle -C POSTROUTING "${rule[@]}" 2>/dev/null
+        result=$?
+        [ "$result" = 1 ] && break
+        [ "$result" = 0 ] || return 1
+        iptables -t mangle -D POSTROUTING "${rule[@]}" || return 1
     done
+    rm -f -- "$STATE_DIR/mss-owned"
 }
 
 build_cpu_mask() {
@@ -287,21 +503,26 @@ smart_tune() {
         print_fail "当前内核未提供 BBR，本次调优未执行。"
         print_info "请先升级到支持 BBR 的系统内核，再重新运行选项 3 或 4。"
         read -p "按回车返回..."
-        return
-    elif [ "$bbr_result" -ne 0 ]; then
+        return 1
+    elif [ "$bbr_result" -ne 0 ] && [ "$bbr_result" -ne 3 ]; then
         local current_cc
         local current_qdisc
         current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
         current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
-        print_fail "BBR + FQ 未完全生效，本次调优未执行。"
+        print_fail "BBR 配置未通过校验，停止后续调优；已保存的快照可用于回退。"
         print_info "当前状态: cc=${current_cc:-未知} qdisc=${current_qdisc:-未知}"
         read -p "按回车返回..."
-        return
+        return 1
     fi
-    print_ok "BBR + FQ 已激活，继续执行${mode_name}。"
+    if [ "$bbr_result" = 3 ]; then
+        print_warn "BBR 和默认 FQ 已设置，实际出口队列未全部确认为 FQ，保留现有队列。"
+    else
+        print_ok "BBR + FQ 已验证。"
+    fi
 
     local mem_total_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
     local cpu_count=$(nproc)
+    [[ "$mem_total_kb" =~ ^[1-9][0-9]*$ ]] || { print_fail "无法读取系统内存。"; return 1; }
     local mem_mb=$((mem_total_kb / 1024))
 
     # 动态缓冲区：基于总内存 5%，最小 4MB，最大 256MB
@@ -311,21 +532,22 @@ smart_tune() {
     [ "$buf_bytes" -lt "$buf_min" ] && buf_bytes=$buf_min
     [ "$buf_bytes" -gt "$buf_max" ] && buf_bytes=$buf_max
 
-    # udp_mem 的单位是内存页，不是字节；按内存动态给上限，避免小内存机器被固定大值压住。
-    local page_size=$(getconf PAGESIZE 2>/dev/null || echo 4096)
-    local udp_max_pages=$((buf_bytes / page_size))
-    [ "$udp_max_pages" -lt 65536 ] && udp_max_pages=65536
-    local udp_pressure_pages=$((udp_max_pages / 2))
-    local udp_min_pages=$((udp_max_pages / 4))
+    # UDP 全局阈值使用内核自行计算的值，不再强制至少 65536 页。
+    if [ -f "$SYSCTL_OPT" ] && grep -q '^net.ipv4.udp_mem[[:space:]]*=' "$SYSCTL_OPT"; then
+        print_warn "将移除旧版 udp_mem 持久化项；缺少原值时，当前旧阈值需重启后由内核重新计算。"
+    fi
 
     # conntrack 表大小：基于内存动态计算，最小 65536
     local conntrack_max=$((mem_total_kb / 16))
     [ "$conntrack_max" -lt 65536 ] && conntrack_max=65536
 
     # 保存优化前的旧值用于对比
-    local old_somax=$(sysctl -n net.core.somaxconn 2>/dev/null || echo "128")
-    local old_rmem=$(sysctl -n net.core.rmem_max 2>/dev/null || echo "212992")
+    local old_somax=$(sysctl -n net.core.somaxconn 2>/dev/null || echo '不可读')
+    local old_rmem=$(sysctl -n net.core.rmem_max 2>/dev/null || echo '不可读')
     local old_file=$(ulimit -n)
+    local old_conntrack=$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || echo '不可读')
+    local old_forward=$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo '不可读')
+    local old_ecn=$(sysctl -n net.ipv4.tcp_ecn 2>/dev/null || echo '不可读')
 
     echo -e "  核心数: ${CYAN}${cpu_count}${NC} | 内存: ${CYAN}${mem_mb}MB${NC}"
     echo -e "  模式: ${CYAN}${mode_name}${NC}"
@@ -334,9 +556,12 @@ smart_tune() {
 
     echo -e "\n${YELLOW}>>> 正在写入内核参数配置...${NC}"
 
-    cat > "$SYSCTL_OPT" <<EOF
+    local source
+    source=$(mktemp "$STATE_DIR/tune.XXXXXX") || return 1
+    if ! cat > "$source" <<EOF
 # ===== TCP/UDP 网络性能调优 =====
 # 由 tcp.sh 自动生成，勿手动编辑
+# mode=$mode
 
 # --- 连接队列与端口 ---
 net.core.somaxconn = 65535
@@ -356,7 +581,7 @@ net.ipv4.tcp_wmem = 4096 65536 ${buf_bytes}
 # --- UDP 缓冲区 (Hysteria2/QUIC 高并发) ---
 net.ipv4.udp_rmem_min = 16384
 net.ipv4.udp_wmem_min = 16384
-net.ipv4.udp_mem = ${udp_min_pages} ${udp_pressure_pages} ${udp_max_pages}
+# udp_mem 保留内核全局内存阈值
 
 # --- 连接稳定性与快速回收 ---
 net.ipv4.tcp_slow_start_after_idle = 0
@@ -387,89 +612,139 @@ net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
 net.netfilter.nf_conntrack_udp_timeout = 60
 net.netfilter.nf_conntrack_udp_timeout_stream = 180
 EOF
+    then
+        rm -f -- "$source"; print_fail "生成调优配置失败。"; return 1
+    fi
 
     if [ "$enable_forward" -eq 1 ]; then
-        cat >> "$SYSCTL_OPT" <<'EOF'
+        if ! cat >> "$source" <<'EOF'
 
 # --- 中转/VPN/代理转发专用 ---
 net.ipv4.ip_forward = 1
 net.ipv6.conf.all.forwarding = 1
 EOF
+        then rm -f -- "$source"; return 1; fi
+    else
+        # 从中转切回通用时，持久化恢复值，避免重启后再被旧转发配置开启。
+        local key saved
+        for key in net.ipv4.ip_forward net.ipv6.conf.all.forwarding; do
+            if saved=$(get_state_value "$key"); then
+                printf '%s = %s\n' "$key" "$saved" >> "$source" || { rm -f -- "$source"; return 1; }
+            fi
+        done
     fi
 
     # 确保 nf_conntrack 模块已加载（否则 sysctl 会报错）
     modprobe nf_conntrack &>/dev/null || true
 
-    local sysctl_log="/tmp/tcp-opt-sysctl.log"
-    sysctl --system >"$sysctl_log" 2>&1
+    apply_sysctl_config "$source" "$SYSCTL_OPT" opt
     local sysctl_exit=$?
+    rm -f -- "$source"
+    if [ "$sysctl_exit" = 1 ]; then
+        print_fail "配置提交失败，停止后续修改；快照保留，可使用选项 6。"; return 1
+    fi
 
     # 文件句柄与进程限制
-    mkdir -p /etc/security/limits.d/
-    cat > "$LIMITS_OPT" <<'EOF'
+    if ! mkdir -p "$(dirname "$LIMITS_OPT")" || ! backup_managed_file "$LIMITS_OPT" limits; then
+        print_fail "无法备份 limits 配置，已保留网络参数快照。"; return 1
+    fi
+    if ! atomic_write "$LIMITS_OPT" 644 <<'EOF'
 * soft nofile 1048576
 * hard nofile 1048576
 * soft nproc 65535
 * hard nproc 65535
 EOF
+    then
+        print_fail "limits 写入失败；网络参数已应用，快照保留。"; return 1
+    fi
 
     # MSS Clamp 只在中转增强模式启用，普通 VPS 不默认改防火墙规则。
     if [ "$enable_forward" -eq 1 ]; then
-        add_mss_clamp_rule
+        add_mss_clamp_rule || sysctl_exit=2
     else
-        local saved_ip_forward=$(get_state_value "ip_forward" "0")
-        local saved_ipv6_forwarding=$(get_state_value "ipv6_forwarding" "0")
-        sysctl -w "net.ipv4.ip_forward=$saved_ip_forward" &>/dev/null
-        sysctl -w "net.ipv6.conf.all.forwarding=$saved_ipv6_forwarding" &>/dev/null
-        remove_mss_clamp_rules
+        remove_mss_clamp_rules || { print_warn "脚本的 MSS Clamp 规则未能移除。"; sysctl_exit=2; }
     fi
 
-    # 刷新当前会话限制
-    ulimit -n 1048576 2>/dev/null || true
-
     # 输出对比结果
-    echo -e "\n${GREEN}✅ 内核调优完成，配置变更对比:${NC}"
+    if [ "$sysctl_exit" = 0 ]; then
+        print_ok "配置已应用，以下为实际读回值。"
+    else
+        print_warn "部分调优未生效，失败项已在上方列出；以下为实际读回值。"
+    fi
     draw_line
     local new_cc
     new_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
     printf "  %-14s: %-15s -> ${GREEN}%-15s${NC}\n" "拥塞算法" "$old_cc" "$new_cc"
-    printf "  %-14s: %-15s -> ${GREEN}%-15s${NC}\n" "最大连接队列" "$old_somax" "65535"
-    printf "  %-14s: %-15s -> ${GREEN}%-15s${NC}\n" "文件句柄" "$old_file" "1048576"
-    printf "  %-14s: %-15s -> ${GREEN}%-15s${NC}\n" "网络缓冲" "$((old_rmem / 1024 / 1024))MB" "$((buf_bytes / 1024 / 1024))MB"
-    printf "  %-14s: %-15s -> ${GREEN}%-15s${NC}\n" "Conntrack" "65536" "$conntrack_max"
-    if [ "$enable_forward" -eq 1 ]; then
-        printf "  %-14s: %-15s -> ${GREEN}%-15s${NC}\n" "IP 转发" "—" "已开启"
-    else
-        printf "  %-14s: %-15s -> ${GREEN}%-15s${NC}\n" "IP 转发" "—" "已恢复/未改动"
-    fi
-    printf "  %-14s: %-15s -> ${GREEN}%-15s${NC}\n" "ECN 模式" "—" "被动响应(2)"
+    printf '  %-14s: %s -> %s\n' '最大连接队列' "$old_somax" "$(sysctl -n net.core.somaxconn 2>/dev/null || echo '不可读')"
+    printf '  %-14s: %s -> %s\n' '当前脚本句柄' "$old_file" "$(ulimit -n)"
+    printf '  %-14s: %s -> %s\n' '接收上限(字节)' "$old_rmem" "$(sysctl -n net.core.rmem_max 2>/dev/null || echo '不可读')"
+    printf '  %-14s: %s -> %s\n' 'Conntrack' "$old_conntrack" "$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || echo '不可读')"
+    printf '  %-14s: %s -> %s\n' 'IPv4 转发' "$old_forward" "$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo '不可读')"
+    printf '  %-14s: %s -> %s\n' 'ECN 模式' "$old_ecn" "$(sysctl -n net.ipv4.tcp_ecn 2>/dev/null || echo '不可读')"
     draw_line
-
-    # 检查 sysctl 是否有参数写入失败（常见于 conntrack 模块未加载等）
-    if [ $sysctl_exit -ne 0 ]; then
-        print_warn "部分参数可能未生效，详情见 $sysctl_log。"
-    fi
 
     print_info "调优配置已持久化至 ${PURPLE}$SYSCTL_OPT${NC}"
     print_info "systemd 服务如需高文件句柄，还应在 unit 中单独设置 LimitNOFILE。"
-    print_info "重启后配置依然生效，回退请使用选项 6。"
+    print_info "limits 对后续登录生效，不会修改已运行服务；回退请使用选项 6。"
+    print_info "其他系统配置仍可能在重启时覆盖同名参数，请重启后复查状态。"
 
     read -p "按回车返回..."
+    return "$sysctl_exit"
 }
 
 # --------------------------------------------------
 # 3d. 网卡多核中断分发 (RPS)
 # --------------------------------------------------
+network_interfaces() {
+    local path iface
+    for path in "$NET_CLASS_DIR"/*; do
+        [ -d "$path" ] || continue
+        iface="${path##*/}"
+        case "$iface" in lo|docker*|veth*|br-*|virbr*|sit*|tun*|tap*|wg*|dummy*) continue ;; esac
+        printf '%s\n' "$iface"
+    done
+}
+
+normalize_rps_value() {
+    awk -F, '{for(i=1;i<=NF;i++) {sub(/^0+/,"",$i); if($i=="") $i="0"}
+        start=1; while(start<NF && $start=="0") start++
+        for(i=start;i<=NF;i++) printf "%s%s", (i>start ? "," : ""), $i; print ""}'
+}
+
+set_rps_value() {
+    local file="$1" key="$2" value="$3" before actual
+    before=$(cat "$file") || return 1
+    snapshot_value "$key" "$before" || return 1
+    printf '%s\n' "$value" > "$file" || return 1
+    actual=$(cat "$file" | normalize_rps_value) || return 1
+    [ "$actual" = "$(printf '%s\n' "$value" | normalize_rps_value)" ]
+}
+
+restore_rps_values() {
+    local key value rest iface queue name file actual failed=0
+    [ -f "$STATE_FILE" ] || return 0
+    while IFS='=' read -r key value; do
+        [[ "$key" == rps:* ]] || continue
+        rest="${key#rps:}"
+        if [[ ! "$rest" =~ ^[a-zA-Z0-9_.:-]+/rx-[0-9]+/(rps_cpus|rps_flow_cnt)$ ]]; then
+            print_warn "无效 RPS 快照键: $key"; failed=1; continue
+        fi
+        IFS=/ read -r iface queue name <<< "$rest"
+        file="$NET_CLASS_DIR/$iface/queues/$queue/$name"
+        if [ ! -f "$file" ]; then
+            print_warn "网卡队列已不存在，保留快照: $file"; failed=1; continue
+        fi
+        if ! printf '%s\n' "$value" > "$file"; then failed=1; continue; fi
+        actual=$(cat "$file" | normalize_rps_value)
+        [ "$actual" = "$(printf '%s\n' "$value" | normalize_rps_value)" ] || failed=1
+    done < "$STATE_FILE"
+    return "$failed"
+}
+
 optimize_nic() {
     echo -e "\n${YELLOW}>>> 正在执行多核心中断分发 (RPS/RFS) 优化...${NC}"
 
-    if ! command -v ethtool &>/dev/null; then
-        echo -e "${YELLOW}正在安装 ethtool...${NC}"
-        apt-get update -qq && apt-get install -y -qq ethtool 2>/dev/null || yum install -y -q ethtool 2>/dev/null || true
-    fi
-
-    # 过滤出物理/主网络接口，排除虚拟接口
-    local interfaces=$(ls /sys/class/net | grep -vE '^(lo|docker[0-9]*|veth|br-|virbr|any|sit[0-9]*|tun[0-9]*|tap[0-9]*|wg[0-9]*|dummy)$')
+    local interfaces=$(network_interfaces)
     local cpu_count=$(nproc)
 
     if [ "$cpu_count" -le 1 ]; then
@@ -481,47 +756,42 @@ optimize_nic() {
     # 计算 RPS CPU 掩码（所有核心参与）
     local rps_cpus=$(build_cpu_mask "$cpu_count")
 
-    local configured=0
+    local configured=0 failed=0 eth file queue before
+    ensure_state || return 1
     for eth in $interfaces; do
-        [ ! -d "/sys/class/net/$eth" ] && continue
-
-        # 尝试调整环形缓冲区（VPS 上大概率失败，静默处理）
-        local max_rx=$(ethtool -g "$eth" 2>/dev/null | awk '/Pre-set maximums/{found=1} found && /RX:/{print $2; exit}')
-        local max_tx=$(ethtool -g "$eth" 2>/dev/null | awk '/Pre-set maximums/{found=1} found && /TX:/{print $2; exit}')
-        if [ -n "$max_rx" ]; then
-            ethtool -G "$eth" rx "$max_rx" 2>/dev/null || true
-        fi
-        if [ -n "$max_tx" ]; then
-            ethtool -G "$eth" tx "$max_tx" 2>/dev/null || true
-        fi
-
-        # 设置 RPS：将每个 RX 队列的处理分发到所有 CPU
-        for rps_file in /sys/class/net/$eth/queues/rx-*/rps_cpus; do
-            [ -f "$rps_file" ] && echo "$rps_cpus" > "$rps_file"
+        for file in "$NET_CLASS_DIR/$eth"/queues/rx-*/rps_cpus "$NET_CLASS_DIR/$eth"/queues/rx-*/rps_flow_cnt; do
+            [ -f "$file" ] || continue
+            queue="${file%/*}"; queue="${queue##*/}"
+            local value=4096
+            [ "${file##*/}" != rps_cpus ] || value="$rps_cpus"
+            if set_rps_value "$file" "rps:$eth/$queue/${file##*/}" "$value"; then
+                configured=$((configured + 1))
+            else
+                print_warn "RPS/RFS 写入或验证失败: $file"; failed=1
+            fi
         done
-
-        # 设置 RFS：每个 RX 队列的流表大小
-        for rfc_file in /sys/class/net/$eth/queues/rx-*/rps_flow_cnt; do
-            [ -f "$rfc_file" ] && echo "4096" > "$rfc_file"
-        done
-
-        print_ok "接口 ${CYAN}$eth${NC}: RPS 掩码=0x${rps_cpus} (覆盖 ${cpu_count} 核心)"
-        configured=$((configured + 1))
     done
 
     # 全局 RFS 表
-    sysctl -w net.core.rps_sock_flow_entries=32768 &>/dev/null
+    if [ "$configured" -gt 0 ]; then
+        if ! before=$(sysctl -n net.core.rps_sock_flow_entries 2>/dev/null) ||
+           ! snapshot_value net.core.rps_sock_flow_entries "$before" ||
+           ! sysctl -q -w net.core.rps_sock_flow_entries=32768 ||
+           [ "$(sysctl -n net.core.rps_sock_flow_entries 2>/dev/null)" != 32768 ]; then
+            print_warn "全局 RFS 设置失败，快照已保留。"; failed=1
+        fi
+    fi
 
     if [ "$configured" -eq 0 ]; then
         print_warn "未找到可配置的网络接口。"
     else
-        echo -e "\n${GREEN}✅ RPS/RFS 配置完成:${NC}"
+        if [ "$failed" = 0 ]; then print_ok "RPS/RFS 写入并验证完成。"; else print_warn "RPS/RFS 仅部分生效。"; fi
         draw_line
-        printf "  %-22s : ${GREEN}%s${NC}\n" "配置接口数" "$configured"
+        printf "  %-22s : ${GREEN}%s${NC}\n" "成功设置项" "$configured"
         printf "  %-22s : ${GREEN}%s 核心${NC}\n" "CPU 分发范围" "$cpu_count"
-        printf "  %-22s : ${GREEN}%s${NC}\n" "全局流表 (RFS)" "32768"
+        printf "  %-22s : %s\n" "全局流表 (RFS)" "$(sysctl -n net.core.rps_sock_flow_entries 2>/dev/null || echo '不可读')"
         draw_line
-        print_info "RPS 是软件级数据包分发（非硬件 RSS），在 VPS 虚拟网卡上是最佳方案。"
+        print_info "RPS 是否有收益取决于现有硬件队列与 CPU 负载，可通过选项 6 恢复原值。"
         print_info "注意：RPS 设置不持久化，重启后需重新执行。"
     fi
 
@@ -532,80 +802,100 @@ optimize_nic() {
 # 3e. 一键回退
 # --------------------------------------------------
 rollback_all() {
-    # 1. 清理所有配置文件
-    rm -f "$SYSCTL_OPT" "$LIMITS_OPT" "$SYSCTL_BBR"
-
-    # 2. 恢复 gai.conf
-    if [ -f /etc/gai.conf.bak ]; then
-        mv /etc/gai.conf.bak /etc/gai.conf
-    else
-        sed -i '/precedence ::ffff:0:0\/96  100/d' /etc/gai.conf 2>/dev/null || true
+    if [ ! -f "$STATE_FILE" ] && [ ! -d "$STATE_DIR/files" ] &&
+       [ ! -f "$SYSCTL_OPT" ] && [ ! -f "$STATE_DIR/mss-owned" ]; then
+        print_info "没有本脚本的回退记录，系统参数保持不变。"
+        return 0
     fi
-
-    # 3. 尽量恢复首次运行前的关键值；没有状态文件时回落到常见默认值
-    local old_cc=$(get_state_value "tcp_congestion_control" "cubic")
-    local old_qdisc=$(get_state_value "default_qdisc" "fq_codel")
-    local old_ip_forward=$(get_state_value "ip_forward" "0")
-    local old_ipv6_forwarding=$(get_state_value "ipv6_forwarding" "0")
-    sysctl -w "net.ipv4.tcp_congestion_control=$old_cc" &>/dev/null
-    sysctl -w "net.core.default_qdisc=$old_qdisc" &>/dev/null
-    sysctl -w "net.ipv4.ip_forward=$old_ip_forward" &>/dev/null
-    sysctl -w "net.ipv6.conf.all.forwarding=$old_ipv6_forwarding" &>/dev/null
-
-    # 4. 恢复 RPS/RFS
-    sysctl -w net.core.rps_sock_flow_entries=0 &>/dev/null
-    local interfaces=$(ls /sys/class/net | grep -vE '^(lo|docker[0-9]*|veth|br-|virbr|any|sit[0-9]*|tun[0-9]*|tap[0-9]*|wg[0-9]*|dummy)$')
-    for eth in $interfaces; do
-        for rps_file in /sys/class/net/$eth/queues/rx-*/rps_cpus; do
-            [ -f "$rps_file" ] && echo "0" > "$rps_file"
-        done
+    ensure_state || { print_fail "无法读取或迁移快照。"; return 1; }
+    local failed=0 id path
+    for id in bbr opt limits gai; do
+        case "$id" in
+            bbr) path="$SYSCTL_BBR" ;; opt) path="$SYSCTL_OPT" ;;
+            limits) path="$LIMITS_OPT" ;; gai) path="$GAI_FILE" ;;
+        esac
+        if [ -f "$STATE_DIR/legacy-incomplete" ] && [ "$id" != gai ] && [ ! -f "$STATE_DIR/files/$id.kind" ]; then
+            backup_managed_file "$path" "$id" || { failed=1; continue; }
+        fi
+        restore_managed_file "$path" "$id" || { print_warn "文件未能恢复: $path"; failed=1; }
     done
+    restore_sysctl_values "$STATE_FILE" || failed=1
+    restore_rps_values || failed=1
+    remove_mss_clamp_rules || { print_warn "带脚本标记的 MSS 规则未能移除。"; failed=1; }
 
-    # 5. 清理 MSS Clamp 规则
-    remove_mss_clamp_rules
+    if [ "$failed" != 0 ]; then
+        print_fail "回退仅部分成功，所有原值与文件快照均保留，请处理失败项后重试。"
+        return 1
+    fi
+    if [ -f "$STATE_DIR/legacy-incomplete" ]; then
+        print_warn "已恢复可追溯的参数并移除旧调优配置，但旧版缺失的历史值无法自动恢复。"
+        print_info "快照保留在 $STATE_DIR。重启可重新计算内核默认值，但不等于恢复历史手工设置。"
+        print_info "旧版未标记的 MSS 规则、RPS 和 gai.conf.bak 请人工核对；未自动删除或套用。"
+        return 2
+    fi
+    for id in bbr opt limits gai; do
+        rm -f -- "$STATE_DIR/files/$id.kind" "$STATE_DIR/files/$id.original" || return 1
+    done
+    rm -f -- "$STATE_FILE" || return 1
+    rmdir "$STATE_DIR/files" 2>/dev/null || true
+    STATE_READY=0
+    print_ok "本脚本记录的原值和配置已恢复，新增 MSS 规则已移除。"
+    print_info "原有防火墙规则、网卡队列和未被本脚本修改的设置保持不变。"
+}
 
-    # 6. 恢复当前会话文件句柄限制
-    ulimit -n 1024 2>/dev/null || true
-
-    # 7. 重载系统配置
-    sysctl --system &>/dev/null
-
-    echo -e "${GREEN}✅ 回退完成:${NC}"
-    print_ok "配置文件已清理: sysctl, limits, bbr"
-    print_ok "拥塞算法已恢复: $old_cc + $old_qdisc"
-    print_ok "IP 转发已恢复: IPv4=$old_ip_forward IPv6=$old_ipv6_forwarding"
-    print_ok "RPS/RFS 已关闭"
-    print_ok "MSS Clamp 规则已移除"
-    print_ok "IPv4 优先解析已恢复"
-    rm -f "$STATE_FILE"
+config_matches_runtime() {
+    local file="$1" line key value actual count=0
+    [ -f "$file" ] || return 1
+    while IFS= read -r line || [ -n "$line" ]; do
+        [[ "$line" == '# skipped:'* || "$line" == '# rejected:'* ]] && return 1
+        [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+        key="${line%%=*}"; key="${key//[[:space:]]/}"
+        value=$(printf '%s\n' "${line#*=}" | normalize_value)
+        actual=$(sysctl -n "$key" 2>/dev/null | normalize_value) || return 1
+        [ "$actual" = "$value" ] || return 1
+        count=$((count + 1))
+    done < "$file"
+    [ "$count" -gt 0 ]
 }
 
 # ==================================================
 # --- 4. 主菜单 ---
 # ==================================================
+# 串行化配置与快照写入；更新 exec 前释放锁。
+if command -v flock >/dev/null; then
+    mkdir -p /run/lock || exit 1
+    exec 9>/run/lock/vps-netpilot.lock || exit 1
+    flock -n 9 || { print_fail "另一个 VPS NetPilot 正在运行。"; exit 1; }
+fi
 while true; do
     # --- 实时状态检测 ---
     cur_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
     cur_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
 
-    if [ -f /etc/gai.conf ] && grep -q "^precedence ::ffff:0:0/96  100" /etc/gai.conf 2>/dev/null; then
+    if [ -f "$GAI_FILE" ] && grep -q "^precedence ::ffff:0:0/96  100" "$GAI_FILE" 2>/dev/null; then
         status_ipv4="${GREEN}[已激活]${NC}"
     else
         status_ipv4="${RED}[未开启]${NC}"
     fi
 
-    case "$(get_bbr_fq_state "$cur_cc" "$cur_qdisc")" in
+    actual_fq=$(get_actual_fq_state)
+    case "$(get_bbr_fq_state "$cur_cc" "$cur_qdisc" "$actual_fq")" in
         active) status_bbr="${GREEN}[已激活]${NC}" ;;
         partial) status_bbr="${YELLOW}[部分启用]${NC}" ;;
+        unknown) status_bbr="${YELLOW}[无法确认]${NC}" ;;
         *) status_bbr="${RED}[未开启]${NC}" ;;
     esac
 
     if [ -f "$SYSCTL_OPT" ]; then
-        if grep -q "^net.ipv4.ip_forward = 1" "$SYSCTL_OPT" 2>/dev/null; then
-            status_common="${GREEN}[已包含]${NC}"
-            status_transit="${GREEN}[已激活]${NC}"
+        tune_status="${GREEN}[已激活]${NC}"
+        config_matches_runtime "$SYSCTL_OPT" || tune_status="${YELLOW}[部分生效]${NC}"
+        if grep -qx '# mode=transit' "$SYSCTL_OPT" ||
+           { ! grep -q '^# mode=' "$SYSCTL_OPT" && grep -q '^net.ipv4.ip_forward = 1' "$SYSCTL_OPT"; }; then
+            mss_clamp_present || tune_status="${YELLOW}[部分生效]${NC}"
+            status_common="$tune_status"
+            status_transit="$tune_status"
         else
-            status_common="${GREEN}[已激活]${NC}"
+            status_common="$tune_status"
             status_transit="${RED}[未开启]${NC}"
         fi
     else
@@ -638,17 +928,18 @@ while true; do
     draw_line
     cur_fd=$(ulimit -n)
     cur_fwd=$(sysctl -n net.ipv4.ip_forward 2>/dev/null)
-    echo -e "  算法: ${GREEN}${cur_cc}${NC} | 队列: ${GREEN}${cur_qdisc}${NC} | 句柄: ${GREEN}${cur_fd}${NC} | 转发: ${GREEN}${cur_fwd}${NC}"
+    echo -e "  算法: ${cur_cc:-未知} | 默认队列: ${cur_qdisc:-未知} | 实际FQ: $actual_fq"
+    echo -e "  当前脚本句柄: $cur_fd | IPv4 转发: ${cur_fwd:-未知}"
     draw_line
 
-    read -p "请选择 [0-8]: " t_opt
+    read -r -p "请选择 [0-8]: " t_opt || exit 0
     case "$t_opt" in
         1) set_ipv4_priority ;;
         2) enable_bbr ;;
         3) smart_tune common ;;
         4) smart_tune transit ;;
         5) optimize_nic ;;
-        6) rollback_all && read -p "按回车返回..." ;;
+        6) rollback_all; read -r -p "按回车返回..." ;;
         7) check_update ;;
         8) uninstall_script ;;
         0) exit 0 ;;
