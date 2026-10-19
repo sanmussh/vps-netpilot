@@ -111,6 +111,8 @@ GAI_FILE="/etc/gai.conf"
 NET_CLASS_DIR="/sys/class/net"
 MSS_TAG="vps-netpilot"
 RESOLV_FILE="/etc/resolv.conf"
+DNS_STUB_FILE="/run/systemd/resolve/stub-resolv.conf"
+DNS_UPLINK_FILE="/run/systemd/resolve/resolv.conf"
 DNS_RESOLVED_CONF="/etc/systemd/resolved.conf.d/99-vps-netpilot-dns.conf"
 DNS_NM_CONF="/etc/NetworkManager/conf.d/99-vps-netpilot-dns.conf"
 DNS_NM_UPSTREAM="/run/NetworkManager/no-stub-resolv.conf"
@@ -799,20 +801,24 @@ dns_service_active() {
 dns_uses_resolved() {
     dns_service_active systemd-resolved || return 1
     case "$(readlink -f -- "$RESOLV_FILE" 2>/dev/null)" in
-        /run/systemd/resolve/stub-resolv.conf|/usr/lib/systemd/resolv.conf|/lib/systemd/resolv.conf) return 0 ;;
+        "$DNS_STUB_FILE"|/usr/lib/systemd/resolv.conf|/lib/systemd/resolv.conf) return 0 ;;
         *) return 1 ;;
     esac
 }
 
+dns_uses_resolved_uplink() {
+    dns_service_active systemd-resolved && [ -L "$RESOLV_FILE" ] &&
+        [ "$(readlink -f -- "$RESOLV_FILE" 2>/dev/null)" = "$DNS_UPLINK_FILE" ]
+}
+
 dns_backend() {
     if dns_service_active NetworkManager; then
-        if [ -L "$RESOLV_FILE" ] && ! dns_uses_resolved &&
+        if [ -L "$RESOLV_FILE" ] && ! dns_uses_resolved && ! dns_uses_resolved_uplink &&
            [ "$(readlink -f -- "$RESOLV_FILE" 2>/dev/null)" != /run/NetworkManager/resolv.conf ]; then
             echo unsupported
         else echo NetworkManager; fi
     elif dns_service_active systemd-resolved; then
-        # 非 stub 模式的 resolv.conf 不支持按域路由，不能用全局 ~. 保证默认上游。
-        if dns_uses_resolved; then echo resolved; else echo unsupported; fi
+        if dns_uses_resolved || dns_uses_resolved_uplink; then echo resolved; else echo unsupported; fi
     elif [ -L "$RESOLV_FILE" ] || [ ! -f "$RESOLV_FILE" ]; then
         echo unsupported
     elif dns_service_active systemd-networkd || command -v resolvconf >/dev/null ||
@@ -827,15 +833,25 @@ dns_backend() {
 }
 
 show_dns() {
-    local servers
+    local servers backend
     draw_line
-    print_info "系统 DNS 管理方式: $(dns_backend)"
+    backend=$(dns_backend)
+    case "$backend" in
+        resolved)
+            if dns_uses_resolved_uplink; then
+                print_info "系统 DNS 管理方式: systemd-resolved（上游列表模式，可切换至本地解析入口）"
+            else print_info "系统 DNS 管理方式: systemd-resolved（本地解析入口）"; fi ;;
+        unsupported) print_info "系统 DNS 管理方式: 暂不支持自动修改" ;;
+        static) print_info "系统 DNS 管理方式: 静态文件候选（需确认无其他程序接管）" ;;
+        *) print_info "系统 DNS 管理方式: $backend" ;;
+    esac
     [ ! -L "$RESOLV_FILE" ] || print_info "resolv.conf 指向: $(readlink -- "$RESOLV_FILE")"
     servers=$(dns_nameservers "$RESOLV_FILE")
-    printf '  系统解析入口: %s\n' "${servers:-无法读取}"
+    printf '  系统解析入口: %s\n' "$(printf '%s\n' "${servers:-无法读取}" | paste -sd ' ' -)"
     if command -v resolvectl >/dev/null && dns_service_active systemd-resolved; then
         print_info "上游 DNS（Global 为全局，Link 为网卡；不代表每次查询都会使用所有上游）:"
         LC_ALL=C resolvectl dns || print_warn "无法读取上游 DNS。"
+        print_info "DNS 域路由（~. 表示默认查询路径，更具体的域优先）:"
         LC_ALL=C resolvectl domain || print_warn "无法读取 DNS 域路由。"
     elif dns_service_active NetworkManager && [ -r "$DNS_NM_UPSTREAM" ]; then
         print_info "NetworkManager 上游 DNS:"
@@ -845,6 +861,9 @@ show_dns() {
     fi
     if [ -f "$STATE_DIR/dns-backend" ]; then
         print_info "有本脚本的 DNS 修改记录；记录本身不等于当前已生效。"
+        if [ "$backend" = resolved ]; then
+            print_info "网卡仍可能列出原 DNS；默认查询按 Global 的 ~. 路由，专用域按更具体规则处理。"
+        fi
     fi
     print_info "仅管理系统 DNS，不修改 3x-ui/Xray 自定义 DNS、DoH 或客户端 DNS。"
 }
@@ -875,9 +894,11 @@ dns_runtime_valid() {
     local backend="$1" servers domains
     case "$backend" in
         resolved)
+            dns_uses_resolved || return 1
+            if [ -f "$STATE_DIR/files/dns-resolv.link" ]; then dns_stub_listener_valid || return 1; fi
             servers=$(LC_ALL=C resolvectl dns) || return 1
             domains=$(LC_ALL=C resolvectl domain) || return 1
-            [ "$(printf '%s\n' "$servers" | awk '/^Global:/ {sub(/^Global:[[:space:]]*/, ""); $1=$1; print}')" = 1.1.1.1 ] || return 1
+            [ "$(printf '%s\n' "$servers" | awk '/^Global:/ {sub(/^Global:[[:space:]]*/, ""); $1=$1; print}')" = '1.1.1.1 8.8.8.8' ] || return 1
             printf '%s\n' "$domains" | awk '
                 /^Global:/ {for(i=2;i<=NF;i++) if($i=="~.") found=1}
                 /^Link / {for(i=1;i<=NF;i++) if($i=="~.") conflict=1}
@@ -891,16 +912,71 @@ dns_runtime_valid() {
                 # 不能仅凭 NM 的生成文件判成功，系统入口可能是 unmanaged。
                 servers=$(dns_nameservers "$RESOLV_FILE" | sort -u)
             fi
-            [ "$servers" = 1.1.1.1 ] ;;
-        static) [ "$(dns_nameservers "$RESOLV_FILE")" = 1.1.1.1 ] ;;
+            [ "$servers" = $'1.1.1.1\n8.8.8.8' ] ;;
+        static) [ "$(dns_nameservers "$RESOLV_FILE")" = $'1.1.1.1\n8.8.8.8' ] ;;
         *) return 1 ;;
     esac
+}
+
+# 原子替换已知符号链接；不写入目标文件，也不覆盖外部新接管的配置。
+dns_replace_link() {
+    local target="$1" expected="$2" tmp
+    [ -L "$RESOLV_FILE" ] && [ "$(readlink -- "$RESOLV_FILE")" = "$expected" ] || return 1
+    tmp=$(mktemp "${RESOLV_FILE}.XXXXXX") || return 1
+    if ! ln -sfn -- "$target" "$tmp" || [ ! -L "$tmp" ] ||
+       [ ! -L "$RESOLV_FILE" ] || [ "$(readlink -- "$RESOLV_FILE")" != "$expected" ] ||
+       ! mv -Tf -- "$tmp" "$RESOLV_FILE"; then
+        rm -f -- "$tmp"; return 1
+    fi
+}
+
+dns_stub_listener_valid() {
+    local pid protocol sockets
+    pid=$(systemctl show -p MainPID --value systemd-resolved 2>/dev/null) || return 1
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    for protocol in u t; do
+        sockets=$(ss -H -O -4 "-ln${protocol}p" 'sport = :53' 2>/dev/null) || return 1
+        if ! printf '%s\n' "$sockets" | awk -v pid="$pid" '
+            {for(i=1;i<=NF;i++) if($i ~ /^127\.0\.0\.53(%[^:]+)?:53$/ && index($0,"pid=" pid ",")) found=1}
+            END {exit !found}'; then
+            print_warn "无法确认 systemd-resolved 已监听 127.0.0.53:53（$protocol），不采用此入口。"
+            return 1
+        fi
+    done
+}
+
+dns_activate_stub() {
+    local original
+    [ -f "$STATE_DIR/files/dns-resolv.link" ] || return 0
+    original=$(cat "$STATE_DIR/files/dns-resolv.link") || return 1
+    [ "$(dns_nameservers "$DNS_STUB_FILE")" = 127.0.0.53 ] || return 1
+    dns_stub_listener_valid || return 1
+    dns_replace_link "$DNS_STUB_FILE" "$original"
+}
+
+dns_restore_link() {
+    local original current
+    [ -f "$STATE_DIR/files/dns-resolv.link" ] || return 0
+    original=$(cat "$STATE_DIR/files/dns-resolv.link") || return 1
+    [ -n "$original" ] && [ -L "$RESOLV_FILE" ] || return 1
+    current=$(readlink -- "$RESOLV_FILE") || return 1
+    [ "$current" != "$original" ] || return 0
+    [ "$current" = "$DNS_STUB_FILE" ] || return 1
+    dns_replace_link "$original" "$DNS_STUB_FILE"
+}
+
+dns_lookup_works() {
+    # 强制使用 nss-dns，避免 nss-resolve 绕过新入口而掩盖 stub 端口不可用。
+    if [ -f "$STATE_DIR/files/dns-resolv.link" ]; then
+        timeout 12 getent -s dns ahostsv4 example.com >/dev/null || return 1
+    fi
+    timeout 12 getent ahostsv4 example.com >/dev/null
 }
 
 restore_dns() {
     local backend target
     if [ ! -f "$STATE_DIR/dns-backend" ]; then
-        if [ -f "$STATE_DIR/files/dns.kind" ]; then
+        if [ -f "$STATE_DIR/files/dns.kind" ] || [ -f "$STATE_DIR/files/dns-resolv.link" ]; then
             print_fail "DNS 快照缺少管理方式记录，请人工核对，未删除快照。"; return 1
         fi
         print_info "没有 DNS 回退记录。"; return 0
@@ -913,18 +989,22 @@ restore_dns() {
     fi
     [ -f "$STATE_DIR/files/dns.kind" ] || { print_fail "DNS 文件快照缺失。"; return 1; }
     [ ! -L "$target" ] || { print_fail "DNS 配置路径已变成符号链接，快照保留。"; return 1; }
+    if ! dns_restore_link; then
+        print_fail "DNS 入口链接恢复失败或已由外部修改，配置和快照保留。"; return 1
+    fi
     if ! restore_managed_file "$target" dns || ! dns_reload "$backend"; then
         print_fail "DNS 恢复或重新加载失败，快照保留，请重试。"; return 1
     fi
-    rm -f -- "$STATE_DIR/dns-backend" "$STATE_DIR/files/dns.kind" "$STATE_DIR/files/dns.original" || return 1
+    rm -f -- "$STATE_DIR/dns-backend" "$STATE_DIR/files/dns.kind" "$STATE_DIR/files/dns.original" \
+        "$STATE_DIR/files/dns-resolv.link" || return 1
     print_ok "已恢复修改前的 DNS 配置；动态 DNS 继续由原管理服务提供。"
 }
 
 set_cloudflare_dns() {
-    local backend target domains tmp
+    local backend target domains tmp original_link="" stub_setting=""
     backend=$(dns_backend)
     target=$(dns_target "$backend") || {
-        print_fail "未识别出可安全持久化的管理方式（可能是 DHCP、resolvconf、容器或非 stub 模式）。"
+        print_fail "未识别出可安全持久化的管理方式（可能是独立 DHCP、resolvconf、容器或未知链接）。"
         print_info "未修改 DNS。请先核对网络配置来源，不能直接覆盖 resolv.conf。"; return 1
     }
     command -v timeout >/dev/null && command -v getent >/dev/null || {
@@ -936,7 +1016,7 @@ set_cloudflare_dns() {
         fi
         print_fail "已有 DNS 修改记录且当前状态不一致，请先用 DNS 子菜单恢复后重试。"; return 1
     fi
-    if [ -f "$STATE_DIR/files/dns.kind" ]; then
+    if [ -f "$STATE_DIR/files/dns.kind" ] || [ -f "$STATE_DIR/files/dns-resolv.link" ]; then
         print_fail "发现不完整的 DNS 快照，请先人工核对 $STATE_DIR/files/dns.*，未继续修改。"; return 1
     fi
     case "$backend" in
@@ -948,26 +1028,35 @@ set_cloudflare_dns() {
             domains=$(LC_ALL=C resolvectl domain) || return 1
             if printf '%s\n' "$domains" | grep -Eq '^Link .*:.*[[:space:]]~\.([[:space:]]|$)'; then
                 print_fail "网卡/VPN 已配置默认 DNS 域路由 ~.，不覆盖，需先人工核对。"; return 1
+            fi
+            if dns_uses_resolved_uplink; then
+                command -v ss >/dev/null || { print_fail "缺少 ss（iproute2），无法验证本地 DNS 监听端口，未修改。"; return 1; }
+                original_link=$(readlink -- "$RESOLV_FILE") || return 1
+                stub_setting='DNSStubListener=yes'
             fi ;;
     esac
     ensure_state && mkdir -p -- "$(dirname -- "$target")" && backup_managed_file "$target" dns || return 1
     printf '%s\n' "$backend" | atomic_write "$STATE_DIR/dns-backend" || return 1
+    if [ -n "$original_link" ]; then
+        printf '%s\n' "$original_link" | atomic_write "$STATE_DIR/files/dns-resolv.link" || return 1
+    fi
     tmp=$(mktemp "$STATE_DIR/dns-config.XXXXXX") || { restore_dns; return 1; }
+    # 备选地址属于 DNS 列表；FallbackDNS 仅在没有其他 DNS 配置时使用。
     case "$backend" in
         NetworkManager)
-            printf '[global-dns-domain-*]\nservers=1.1.1.1\n' > "$tmp" ;;
+            printf '[global-dns-domain-*]\nservers=1.1.1.1,8.8.8.8\n' > "$tmp" ;;
         resolved)
-            printf '[Resolve]\nDNS=\nDNS=1.1.1.1\nFallbackDNS=\nDomains=~.\n' > "$tmp" ;;
+            printf '[Resolve]\nDNS=\nDNS=1.1.1.1 8.8.8.8\nFallbackDNS=\nDomains=~.\n%s\n' "$stub_setting" > "$tmp" ;;
         static)
             # 保留 search/options 等非 nameserver 设置。
-            awk '$1!="nameserver" {print} END {print "nameserver 1.1.1.1"}' "$RESOLV_FILE" > "$tmp" ;;
+            awk '$1!="nameserver" {print} END {print "nameserver 1.1.1.1"; print "nameserver 8.8.8.8"}' "$RESOLV_FILE" > "$tmp" ;;
     esac
     if [ "$?" = 0 ] && atomic_write "$target" 644 < "$tmp" &&
-       dns_reload "$backend" && dns_runtime_valid "$backend" &&
-       timeout 12 getent ahostsv4 example.com >/dev/null; then
+       dns_reload "$backend" && dns_activate_stub && dns_runtime_valid "$backend" && dns_lookup_works; then
         rm -f -- "$tmp"
         print_ok "默认 DNS 配置已写入磁盘，上游检查和系统解析测试通过。"
-        print_info "目标为 1.1.1.1；未重启网卡、Xray 或 3x-ui。"
+        print_info "DNS 列表：1.1.1.1（首选）、8.8.8.8（备选）；未重启网卡、Xray 或 3x-ui。"
+        print_info "实际使用哪个上游由解析器决定，不保证备选只在首选超时时使用。"
         print_info "专用域路由可能继续使用内网 DNS；应用已有连接/缓存不会立即改变。"
         print_info "重启后可用选项 9 再检查，外部管理工具仍可能覆盖配置。"
         return 0
@@ -982,13 +1071,18 @@ dns_menu() {
     local choice confirm backend
     while true; do
         show_dns
-        printf '\n  1. 默认 DNS 改为 1.1.1.1 并持久化\n  2. 恢复修改前的 DNS 配置\n  0. 返回主菜单\n'
+        printf '\n  1. 设置 DNS：1.1.1.1 首选 / 8.8.8.8 备选（持久化）\n  2. 恢复修改前的 DNS 配置\n  0. 返回主菜单\n'
         read -r -p "请选择 [0-2]: " choice || return 0
         case "$choice" in
             1)
                 backend=$(dns_backend)
-                print_warn "1.1.1.1 并非所有线路都更快；仅 IPv6 的 VPS 无法直接访问此 IPv4 地址。"
+                print_warn "1.1.1.1 / 8.8.8.8 不保证更快；仅 IPv6 的 VPS 无法直接访问这些 IPv4 地址。"
+                print_info "按上述顺序配置 DNS；解析器可能在切换后继续使用备选，并非严格主备。"
                 print_warn "可能影响内网域名/VPN 分流；NetworkManager 全局 DNS 会覆盖连接级 DNS。"
+                if [ "$backend" = resolved ] && dns_uses_resolved_uplink; then
+                    print_info "将备份原链接，并切换至本地入口 127.0.0.53，由它使用上述 DNS 列表。"
+                    print_info "会重启 DNS 解析服务，不重启网卡；DNS 子菜单恢复时会还原原链接。"
+                fi
                 if [ "$backend" = static ]; then
                     print_warn "静态文件候选：请确认没有 DHCP、cloud-init 或启动脚本重写 resolv.conf。"
                 fi
@@ -1013,7 +1107,8 @@ rollback_all() {
     fi
     ensure_state || { print_fail "无法读取或迁移快照。"; return 1; }
     local failed=0 id path
-    if [ -f "$STATE_DIR/dns-backend" ] || [ -f "$STATE_DIR/files/dns.kind" ]; then
+    if [ -f "$STATE_DIR/dns-backend" ] || [ -f "$STATE_DIR/files/dns.kind" ] ||
+       [ -f "$STATE_DIR/files/dns-resolv.link" ]; then
         restore_dns || failed=1
     fi
     for id in bbr opt limits gai; do
