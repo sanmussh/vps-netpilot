@@ -110,6 +110,10 @@ STATE_FILE="$STATE_DIR/original-values"
 GAI_FILE="/etc/gai.conf"
 NET_CLASS_DIR="/sys/class/net"
 MSS_TAG="vps-netpilot"
+RESOLV_FILE="/etc/resolv.conf"
+DNS_RESOLVED_CONF="/etc/systemd/resolved.conf.d/99-vps-netpilot-dns.conf"
+DNS_NM_CONF="/etc/NetworkManager/conf.d/99-vps-netpilot-dns.conf"
+DNS_NM_UPSTREAM="/run/NetworkManager/no-stub-resolv.conf"
 
 # 同目录临时文件保证替换原子性；写入失败时保留原文件。
 atomic_write() {
@@ -799,16 +803,236 @@ optimize_nic() {
 }
 
 # --------------------------------------------------
-# 3e. 一键回退
+# 3e. 系统 DNS
+# --------------------------------------------------
+dns_nameservers() {
+    awk '$1=="nameserver" {print $2}' "$1" 2>/dev/null
+}
+
+dns_service_active() {
+    command -v systemctl >/dev/null && systemctl is-active --quiet "$1"
+}
+
+dns_uses_resolved() {
+    dns_service_active systemd-resolved || return 1
+    case "$(readlink -f -- "$RESOLV_FILE" 2>/dev/null)" in
+        /run/systemd/resolve/stub-resolv.conf|/usr/lib/systemd/resolv.conf|/lib/systemd/resolv.conf) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+dns_backend() {
+    if dns_service_active NetworkManager; then
+        if [ -L "$RESOLV_FILE" ] && ! dns_uses_resolved &&
+           [ "$(readlink -f -- "$RESOLV_FILE" 2>/dev/null)" != /run/NetworkManager/resolv.conf ]; then
+            echo unsupported
+        else echo NetworkManager; fi
+    elif dns_service_active systemd-resolved; then
+        # 非 stub 模式的 resolv.conf 不支持按域路由，不能用全局 ~. 保证默认上游。
+        if dns_uses_resolved; then echo resolved; else echo unsupported; fi
+    elif [ -L "$RESOLV_FILE" ] || [ ! -f "$RESOLV_FILE" ]; then
+        echo unsupported
+    elif dns_service_active systemd-networkd || command -v resolvconf >/dev/null ||
+         ! command -v pgrep >/dev/null || pgrep -x 'dhclient|dhcpcd|udhcpc' >/dev/null ||
+         grep -Eqi 'generated|managed|dhcp|cloud-init|resolvconf' "$RESOLV_FILE" ||
+         grep -Eqs '^[[:space:]]*iface[[:space:]].*[[:space:]]dhcp' /etc/network/interfaces /etc/network/interfaces.d/*; then
+        echo unsupported
+    else
+        # 只能排除常见管理程序；静态文件仍需用户确认没有启动脚本接管。
+        echo static
+    fi
+}
+
+show_dns() {
+    local servers
+    draw_line
+    print_info "系统 DNS 管理方式: $(dns_backend)"
+    [ ! -L "$RESOLV_FILE" ] || print_info "resolv.conf 指向: $(readlink -- "$RESOLV_FILE")"
+    servers=$(dns_nameservers "$RESOLV_FILE")
+    printf '  系统解析入口: %s\n' "${servers:-无法读取}"
+    if command -v resolvectl >/dev/null && dns_service_active systemd-resolved; then
+        print_info "上游 DNS（Global 为全局，Link 为网卡；不代表每次查询都会使用所有上游）:"
+        LC_ALL=C resolvectl dns || print_warn "无法读取上游 DNS。"
+        LC_ALL=C resolvectl domain || print_warn "无法读取 DNS 域路由。"
+    elif dns_service_active NetworkManager && [ -r "$DNS_NM_UPSTREAM" ]; then
+        print_info "NetworkManager 上游 DNS:"
+        dns_nameservers "$DNS_NM_UPSTREAM"
+    elif printf '%s\n' "$servers" | grep -Eq '^(127\.|::1$)'; then
+        print_warn "检测到本地 DNS 转发器，真实上游无法仅从 resolv.conf 判断。"
+    fi
+    if [ -f "$STATE_DIR/dns-backend" ]; then
+        print_info "有本脚本的 DNS 修改记录；记录本身不等于当前已生效。"
+    fi
+    print_info "仅管理系统 DNS，不修改 3x-ui/Xray 自定义 DNS、DoH 或客户端 DNS。"
+}
+
+dns_target() {
+    case "$1" in
+        NetworkManager) printf '%s\n' "$DNS_NM_CONF" ;;
+        resolved) printf '%s\n' "$DNS_RESOLVED_CONF" ;;
+        static) printf '%s\n' "$RESOLV_FILE" ;;
+        *) return 1 ;;
+    esac
+}
+
+dns_reload() {
+    case "$1" in
+        NetworkManager)
+            dns_service_active NetworkManager &&
+                nmcli --wait 15 general reload conf && nmcli --wait 15 general reload dns-full ;;
+        resolved)
+            # 加载失败可能使服务退出；恢复旧文件后仍需尝试启动解析器。
+            timeout 20 systemctl restart systemd-resolved ;;
+        static) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+dns_runtime_valid() {
+    local backend="$1" servers domains
+    case "$backend" in
+        resolved)
+            servers=$(LC_ALL=C resolvectl dns) || return 1
+            domains=$(LC_ALL=C resolvectl domain) || return 1
+            [ "$(printf '%s\n' "$servers" | awk '/^Global:/ {sub(/^Global:[[:space:]]*/, ""); $1=$1; print}')" = 1.1.1.1 ] || return 1
+            printf '%s\n' "$domains" | awk '
+                /^Global:/ {for(i=2;i<=NF;i++) if($i=="~.") found=1}
+                /^Link / {for(i=1;i<=NF;i++) if($i=="~.") conflict=1}
+                END {exit !(found && !conflict)}' ;;
+        NetworkManager)
+            # 检查实际生成的上游列表，不把连接配置中的 DHCP DNS 当作实际结果。
+            if dns_uses_resolved; then
+                servers=$(LC_ALL=C resolvectl dns) || return 1
+                servers=$(printf '%s\n' "$servers" | awk '{sub(/^[^:]*:[[:space:]]*/, ""); for(i=1;i<=NF;i++) print $i}' | sort -u)
+            else
+                # 不能仅凭 NM 的生成文件判成功，系统入口可能是 unmanaged。
+                servers=$(dns_nameservers "$RESOLV_FILE" | sort -u)
+            fi
+            [ "$servers" = 1.1.1.1 ] ;;
+        static) [ "$(dns_nameservers "$RESOLV_FILE")" = 1.1.1.1 ] ;;
+        *) return 1 ;;
+    esac
+}
+
+restore_dns() {
+    local backend target
+    if [ ! -f "$STATE_DIR/dns-backend" ]; then
+        if [ -f "$STATE_DIR/files/dns.kind" ]; then
+            print_fail "DNS 快照缺少管理方式记录，请人工核对，未删除快照。"; return 1
+        fi
+        print_info "没有 DNS 回退记录。"; return 0
+    fi
+    backend=$(cat "$STATE_DIR/dns-backend")
+    target=$(dns_target "$backend") || { print_fail "DNS 快照类型无效，未执行恢复。"; return 1; }
+    # 恢复入口不能因外部管理方式变化而覆盖新的 resolv.conf。
+    if [ "$backend" = static ] && { [ -L "$RESOLV_FILE" ] || [ "$(dns_backend)" != static ]; }; then
+        print_fail "resolv.conf 已由其他程序接管，请人工核对，快照保留。"; return 1
+    fi
+    [ -f "$STATE_DIR/files/dns.kind" ] || { print_fail "DNS 文件快照缺失。"; return 1; }
+    [ ! -L "$target" ] || { print_fail "DNS 配置路径已变成符号链接，快照保留。"; return 1; }
+    if ! restore_managed_file "$target" dns || ! dns_reload "$backend"; then
+        print_fail "DNS 恢复或重新加载失败，快照保留，请重试。"; return 1
+    fi
+    rm -f -- "$STATE_DIR/dns-backend" "$STATE_DIR/files/dns.kind" "$STATE_DIR/files/dns.original" || return 1
+    print_ok "已恢复修改前的 DNS 配置；动态 DNS 继续由原管理服务提供。"
+}
+
+set_cloudflare_dns() {
+    local backend target domains tmp
+    backend=$(dns_backend)
+    target=$(dns_target "$backend") || {
+        print_fail "未识别出可安全持久化的管理方式（可能是 DHCP、resolvconf、容器或非 stub 模式）。"
+        print_info "未修改 DNS。请先核对网络配置来源，不能直接覆盖 resolv.conf。"; return 1
+    }
+    command -v timeout >/dev/null && command -v getent >/dev/null || {
+        print_fail "缺少 timeout/getent，无法完成有时限的解析验证，未修改。"; return 1
+    }
+    if [ -f "$STATE_DIR/dns-backend" ]; then
+        if [ "$(cat "$STATE_DIR/dns-backend")" = "$backend" ] && dns_runtime_valid "$backend"; then
+            print_info "已有本脚本的配置，当前上游检查通过；不覆盖原始快照。"; return 0
+        fi
+        print_fail "已有 DNS 修改记录且当前状态不一致，请先用 DNS 子菜单恢复后重试。"; return 1
+    fi
+    if [ -f "$STATE_DIR/files/dns.kind" ]; then
+        print_fail "发现不完整的 DNS 快照，请先人工核对 $STATE_DIR/files/dns.*，未继续修改。"; return 1
+    fi
+    case "$backend" in
+        NetworkManager)
+            command -v nmcli >/dev/null || return 1
+            if dns_service_active systemd-resolved; then command -v resolvectl >/dev/null || return 1; fi ;;
+        resolved)
+            command -v resolvectl >/dev/null || return 1
+            domains=$(LC_ALL=C resolvectl domain) || return 1
+            if printf '%s\n' "$domains" | grep -Eq '^Link .*:.*[[:space:]]~\.([[:space:]]|$)'; then
+                print_fail "网卡/VPN 已配置默认 DNS 域路由 ~.，不覆盖，需先人工核对。"; return 1
+            fi ;;
+    esac
+    ensure_state && mkdir -p -- "$(dirname -- "$target")" && backup_managed_file "$target" dns || return 1
+    printf '%s\n' "$backend" | atomic_write "$STATE_DIR/dns-backend" || return 1
+    tmp=$(mktemp "$STATE_DIR/dns-config.XXXXXX") || { restore_dns; return 1; }
+    case "$backend" in
+        NetworkManager)
+            printf '[global-dns-domain-*]\nservers=1.1.1.1\n' > "$tmp" ;;
+        resolved)
+            printf '[Resolve]\nDNS=\nDNS=1.1.1.1\nFallbackDNS=\nDomains=~.\n' > "$tmp" ;;
+        static)
+            # 保留 search/options 等非 nameserver 设置。
+            awk '$1!="nameserver" {print} END {print "nameserver 1.1.1.1"}' "$RESOLV_FILE" > "$tmp" ;;
+    esac
+    if [ "$?" = 0 ] && atomic_write "$target" 644 < "$tmp" &&
+       dns_reload "$backend" && dns_runtime_valid "$backend" &&
+       timeout 12 getent ahostsv4 example.com >/dev/null; then
+        rm -f -- "$tmp"
+        print_ok "默认 DNS 配置已写入磁盘，上游检查和系统解析测试通过。"
+        print_info "目标为 1.1.1.1；未重启网卡、Xray 或 3x-ui。"
+        print_info "专用域路由可能继续使用内网 DNS；应用已有连接/缓存不会立即改变。"
+        print_info "重启后可用选项 9 再检查，外部管理工具仍可能覆盖配置。"
+        return 0
+    fi
+    rm -f -- "$tmp"
+    print_fail "写入、加载、上游检查或解析测试失败，正在恢复修改前配置。"
+    restore_dns || print_fail "自动恢复未完成，请保留当前 SSH 会话并处理 DNS 回退记录。"
+    return 1
+}
+
+dns_menu() {
+    local choice confirm backend
+    while true; do
+        show_dns
+        printf '\n  1. 默认 DNS 改为 1.1.1.1 并持久化\n  2. 恢复修改前的 DNS 配置\n  0. 返回主菜单\n'
+        read -r -p "请选择 [0-2]: " choice || return 0
+        case "$choice" in
+            1)
+                backend=$(dns_backend)
+                print_warn "1.1.1.1 并非所有线路都更快；仅 IPv6 的 VPS 无法直接访问此 IPv4 地址。"
+                print_warn "可能影响内网域名/VPN 分流；NetworkManager 全局 DNS 会覆盖连接级 DNS。"
+                if [ "$backend" = static ]; then
+                    print_warn "静态文件候选：请确认没有 DHCP、cloud-init 或启动脚本重写 resolv.conf。"
+                fi
+                read -r -p "确认切换系统 DNS？[y/N]: " confirm || return 0
+                [[ "$confirm" =~ ^[Yy]$ ]] && set_cloudflare_dns
+                read -r -p "按回车继续..." || return 0 ;;
+            2) restore_dns; read -r -p "按回车继续..." || return 0 ;;
+            0) return 0 ;;
+            *) print_warn "请输入 0-2。" ;;
+        esac
+    done
+}
+
+# --------------------------------------------------
+# 3f. 一键回退
 # --------------------------------------------------
 rollback_all() {
     if [ ! -f "$STATE_FILE" ] && [ ! -d "$STATE_DIR/files" ] &&
-       [ ! -f "$SYSCTL_OPT" ] && [ ! -f "$STATE_DIR/mss-owned" ]; then
+       [ ! -f "$SYSCTL_OPT" ] && [ ! -f "$STATE_DIR/mss-owned" ] && [ ! -f "$STATE_DIR/dns-backend" ]; then
         print_info "没有本脚本的回退记录，系统参数保持不变。"
         return 0
     fi
     ensure_state || { print_fail "无法读取或迁移快照。"; return 1; }
     local failed=0 id path
+    if [ -f "$STATE_DIR/dns-backend" ] || [ -f "$STATE_DIR/files/dns.kind" ]; then
+        restore_dns || failed=1
+    fi
     for id in bbr opt limits gai; do
         case "$id" in
             bbr) path="$SYSCTL_BBR" ;; opt) path="$SYSCTL_OPT" ;;
@@ -824,7 +1048,7 @@ rollback_all() {
     remove_mss_clamp_rules || { print_warn "带脚本标记的 MSS 规则未能移除。"; failed=1; }
 
     if [ "$failed" != 0 ]; then
-        print_fail "回退仅部分成功，所有原值与文件快照均保留，请处理失败项后重试。"
+        print_fail "回退仅部分成功，未完成项目的快照保留，请处理失败项后重试。"
         return 1
     fi
     if [ -f "$STATE_DIR/legacy-incomplete" ]; then
@@ -924,6 +1148,7 @@ while true; do
     echo -e "  6. 一键回退脚本配置"
     echo -e "  7. 检查并强制同步更新脚本"
     echo -e "  8. 彻底卸载面板脚本"
+    echo -e "  9. 系统 DNS 检测与设置"
     echo -e "  0. 退出脚本"
     draw_line
     cur_fd=$(ulimit -n)
@@ -932,7 +1157,7 @@ while true; do
     echo -e "  当前脚本句柄: $cur_fd | IPv4 转发: ${cur_fwd:-未知}"
     draw_line
 
-    read -r -p "请选择 [0-8]: " t_opt || exit 0
+    read -r -p "请选择 [0-9]: " t_opt || exit 0
     case "$t_opt" in
         1) set_ipv4_priority ;;
         2) enable_bbr ;;
@@ -942,7 +1167,8 @@ while true; do
         6) rollback_all; read -r -p "按回车返回..." ;;
         7) check_update ;;
         8) uninstall_script ;;
+        9) dns_menu ;;
         0) exit 0 ;;
-        *) echo -e "${RED}输入错误，请输入 0-8！${NC}" && sleep 1 ;;
+        *) echo -e "${RED}输入错误，请输入 0-9！${NC}" && sleep 1 ;;
     esac
 done
