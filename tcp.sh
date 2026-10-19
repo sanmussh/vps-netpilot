@@ -313,52 +313,40 @@ set_ipv4_priority() {
 # --------------------------------------------------
 # 3b. BBR + FQ 拥塞控制
 # --------------------------------------------------
-get_actual_fq_state() {
-    local interfaces iface output state unknown=0
-    command -v ip >/dev/null && command -v tc >/dev/null || { echo unknown; return; }
+get_actual_qdiscs() {
+    local interfaces iface output names
+    command -v ip >/dev/null && command -v tc >/dev/null || { echo '无法检测（缺少 ip/tc）'; return; }
     interfaces=$({ ip -o -4 route show default; ip -o -6 route show default; } 2>/dev/null |
         awk '{for(i=1;i<NF;i++) if($i=="dev") print $(i+1)}' | sort -u)
-    [ -n "$interfaces" ] || { echo unknown; return; }
+    [ -n "$interfaces" ] || { echo '未发现默认出口'; return; }
     for iface in $interfaces; do
-        if ! output=$(tc qdisc show dev "$iface" 2>/dev/null); then unknown=1; continue; fi
-        state=$(printf '%s\n' "$output" | awk '
+        if ! output=$(tc qdisc show dev "$iface" 2>/dev/null); then
+            printf '%s: 无法读取队列\n' "$iface"; continue
+        fi
+        # 展示根队列和去重后的子队列类型，不将 ingress/clsact 算作发送队列。
+        names=$(printf '%s\n' "$output" | awk '
             $1=="qdisc" {
-                for(i=1;i<=NF;i++) if($i=="root") {root=$2; handle=$3}
-                for(i=1;i<NF;i++) if($i=="parent") {parent[++n]=$(i+1); kind[n]=$2}
+                if($2=="ingress" || $2=="clsact") next
+                for(i=1;i<=NF;i++) if($i=="root") root=$2
+                for(i=1;i<NF;i++) if($i=="parent" && !seen[$2]++) kinds[++n]=$2
             }
             END {
-                if(root=="fq") {print "fq"; exit}
-                if(root=="mq") {
-                    sub(/:$/, "", handle)
-                    for(j=1;j<=n;j++) {
-                        split(parent[j],p,":")
-                        if(p[1]==handle || (handle=="0" && p[1]=="")) {
-                            leaves++; if(kind[j]!="fq") bad=1
-                        }
-                    }
-                    if(leaves && !bad) {print "fq"; exit}
-                }
-                print (root=="" ? "unknown" : "other")
+                if(root=="") {print "无法识别根队列"; exit}
+                printf "%s", root
+                for(j=1;j<=n;j++) printf "%s%s", (j==1 ? " + " : ", "), kinds[j]
+                printf "\n"
             }')
-        [ "$state" != other ] || { echo other; return; }
-        [ "$state" != unknown ] || unknown=1
+        printf '%s: %s\n' "$iface" "$names"
     done
-    if [ "$unknown" = 1 ]; then echo unknown; else echo fq; fi
 }
 
-get_bbr_fq_state() {
+get_bbr_state() {
     local current_cc="${1-$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)}"
-    local current_qdisc="${2-$(sysctl -n net.core.default_qdisc 2>/dev/null)}"
-    local actual="${3-$(get_actual_fq_state)}"
-    if [ -z "$current_cc" ] || [ -z "$current_qdisc" ]; then
-        echo unknown
-    elif [ "$current_cc" = bbr ] && [ "$current_qdisc" = fq ] && [ "$actual" = fq ]; then
-        echo "active"
-    elif [ "$current_cc" = "bbr" ] || [ "$current_qdisc" = "fq" ]; then
-        echo "partial"
-    else
-        echo "inactive"
-    fi
+    case "$current_cc" in
+        bbr|bbr2|bbr3) echo active ;;
+        '') echo unknown ;;
+        *) echo inactive ;;
+    esac
 }
 
 ensure_bbr_fq() {
@@ -382,13 +370,12 @@ EOF
     result=$?
     rm -f -- "$source"
     [ "$result" = 0 ] || return 2
-    # 默认值不会替换现有 qdisc；这里只检查，不覆盖用户的队列/整形规则。
-    [ "$(get_actual_fq_state)" = fq ] || return 3
+    # 仅设置系统默认值，不覆盖现有网卡队列/整形规则。
     return 0
 }
 
 enable_bbr() {
-    echo -e "\n${YELLOW}>>> 正在激活 BBR + FQ 拥塞算法...${NC}"
+    echo -e "\n${YELLOW}>>> 正在设置 BBR 与默认 FQ 队列...${NC}"
 
     ensure_bbr_fq
     local bbr_result=$?
@@ -398,21 +385,21 @@ enable_bbr() {
     current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
 
     if [ "$bbr_result" -eq 0 ]; then
-        print_ok "BBR + FQ 已成功激活。"
+        print_ok "BBR 已设为系统默认 TCP 算法，默认队列配置已设为 FQ。"
     elif [ "$bbr_result" -eq 1 ]; then
         print_fail "当前内核未提供 BBR，请先升级到支持 BBR 的系统内核。"
-    elif [ "$bbr_result" -eq 3 ]; then
-        print_warn "BBR 与默认 FQ 已设置，实际出口队列未全部验证为 FQ，原队列保持不变。"
     else
         print_fail "配置或校验失败，当前状态: cc=${current_cc:-未知} default_qdisc=${current_qdisc:-未知}"
     fi
 
     print_info "当前内核: $(uname -r)；BBR 实现版本由系统内核提供，脚本不根据内核版本号推测。"
+    print_info "网卡实际队列保持不变，与默认队列不同不代表 BBR 未启用。"
 
     draw_line
     printf "  %-26s : ${GREEN}%s${NC}\n" "Congestion Control" "$current_cc"
     printf "  %-26s : %s\n" "Default qdisc" "$current_qdisc"
-    printf "  %-26s : %s\n" "Actual egress FQ" "$(get_actual_fq_state)"
+    printf '  实际出口队列:\n'
+    get_actual_qdiscs | sed 's/^/    /'
     draw_line
 
     read -p "按回车返回..."
@@ -508,7 +495,7 @@ smart_tune() {
         print_info "请先升级到支持 BBR 的系统内核，再重新运行选项 3 或 4。"
         read -p "按回车返回..."
         return 1
-    elif [ "$bbr_result" -ne 0 ] && [ "$bbr_result" -ne 3 ]; then
+    elif [ "$bbr_result" -ne 0 ]; then
         local current_cc
         local current_qdisc
         current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
@@ -518,11 +505,7 @@ smart_tune() {
         read -p "按回车返回..."
         return 1
     fi
-    if [ "$bbr_result" = 3 ]; then
-        print_warn "BBR 和默认 FQ 已设置，实际出口队列未全部确认为 FQ，保留现有队列。"
-    else
-        print_ok "BBR + FQ 已验证。"
-    fi
+    print_ok "系统默认 BBR 和默认 FQ 配置已验证，网卡实际队列保持不变。"
 
     local mem_total_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
     local cpu_count=$(nproc)
@@ -1102,12 +1085,11 @@ while true; do
         status_ipv4="${RED}[未开启]${NC}"
     fi
 
-    actual_fq=$(get_actual_fq_state)
-    case "$(get_bbr_fq_state "$cur_cc" "$cur_qdisc" "$actual_fq")" in
-        active) status_bbr="${GREEN}[已激活]${NC}" ;;
-        partial) status_bbr="${YELLOW}[部分启用]${NC}" ;;
+    actual_qdiscs=$(get_actual_qdiscs)
+    case "$(get_bbr_state "$cur_cc")" in
+        active) status_bbr="${GREEN}[BBR 已启用]${NC}" ;;
         unknown) status_bbr="${YELLOW}[无法确认]${NC}" ;;
-        *) status_bbr="${RED}[未开启]${NC}" ;;
+        *) status_bbr="${RED}[BBR 未启用]${NC}" ;;
     esac
 
     if [ -f "$SYSCTL_OPT" ]; then
@@ -1141,7 +1123,7 @@ while true; do
     echo -e "${GREEN}                   快捷命令: t                     ${NC}"
     echo -e "${YELLOW}==================================================${NC}"
     echo -e "  1. 设置 IPv4 优先解析     $status_ipv4  解决 IPv6 绕路卡顿"
-    echo -e "  2. 开启 BBR + FQ          $status_bbr  降低丢包/提升吞吐"
+    echo -e "  2. 开启 BBR / 设置默认 FQ $status_bbr"
     echo -e "  3. 通用保守内核调优       $status_common  缓冲区/连接/conntrack"
     echo -e "  4. 中转增强调优           $status_transit  通用调优 + IP 转发/MSS Clamp"
     echo -e "  5. 网卡多核分发 (RPS)     $status_nic  消除单核 SoftIRQ 瓶颈"
@@ -1153,7 +1135,9 @@ while true; do
     draw_line
     cur_fd=$(ulimit -n)
     cur_fwd=$(sysctl -n net.ipv4.ip_forward 2>/dev/null)
-    echo -e "  算法: ${cur_cc:-未知} | 默认队列: ${cur_qdisc:-未知} | 实际FQ: $actual_fq"
+    echo -e "  默认 TCP 算法: ${cur_cc:-未知} | 默认队列配置: ${cur_qdisc:-未知}"
+    printf '  实际出口队列:\n'
+    printf '%s\n' "$actual_qdiscs" | sed 's/^/    /'
     echo -e "  当前脚本句柄: $cur_fd | IPv4 转发: ${cur_fwd:-未知}"
     draw_line
 
