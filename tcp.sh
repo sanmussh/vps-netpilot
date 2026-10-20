@@ -898,7 +898,7 @@ dns_runtime_valid() {
             if [ -f "$STATE_DIR/files/dns-resolv.link" ]; then dns_stub_listener_valid || return 1; fi
             servers=$(LC_ALL=C resolvectl dns) || return 1
             domains=$(LC_ALL=C resolvectl domain) || return 1
-            [ "$(printf '%s\n' "$servers" | awk '/^Global:/ {sub(/^Global:[[:space:]]*/, ""); $1=$1; print}')" = '1.1.1.1 8.8.8.8' ] || return 1
+            [ "$(printf '%s\n' "$servers" | awk '/^Global:/ {sub(/^Global:[[:space:]]*/, ""); $1=$1; print}')" = '1.1.1.1 1.0.0.1' ] || return 1
             printf '%s\n' "$domains" | awk '
                 /^Global:/ {for(i=2;i<=NF;i++) if($i=="~.") found=1}
                 /^Link / {for(i=1;i<=NF;i++) if($i=="~.") conflict=1}
@@ -912,8 +912,8 @@ dns_runtime_valid() {
                 # 不能仅凭 NM 的生成文件判成功，系统入口可能是 unmanaged。
                 servers=$(dns_nameservers "$RESOLV_FILE" | sort -u)
             fi
-            [ "$servers" = $'1.1.1.1\n8.8.8.8' ] ;;
-        static) [ "$(dns_nameservers "$RESOLV_FILE")" = $'1.1.1.1\n8.8.8.8' ] ;;
+            [ "$servers" = $'1.0.0.1\n1.1.1.1' ] ;;
+        static) [ "$(dns_nameservers "$RESOLV_FILE")" = $'1.1.1.1\n1.0.0.1' ] ;;
         *) return 1 ;;
     esac
 }
@@ -1044,18 +1044,18 @@ set_cloudflare_dns() {
     # 备选地址属于 DNS 列表；FallbackDNS 仅在没有其他 DNS 配置时使用。
     case "$backend" in
         NetworkManager)
-            printf '[global-dns-domain-*]\nservers=1.1.1.1,8.8.8.8\n' > "$tmp" ;;
+            printf '[global-dns-domain-*]\nservers=1.1.1.1,1.0.0.1\n' > "$tmp" ;;
         resolved)
-            printf '[Resolve]\nDNS=\nDNS=1.1.1.1 8.8.8.8\nFallbackDNS=\nDomains=~.\n%s\n' "$stub_setting" > "$tmp" ;;
+            printf '[Resolve]\nDNS=\nDNS=1.1.1.1 1.0.0.1\nFallbackDNS=\nDomains=~.\n%s\n' "$stub_setting" > "$tmp" ;;
         static)
             # 保留 search/options 等非 nameserver 设置。
-            awk '$1!="nameserver" {print} END {print "nameserver 1.1.1.1"; print "nameserver 8.8.8.8"}' "$RESOLV_FILE" > "$tmp" ;;
+            awk '$1!="nameserver" {print} END {print "nameserver 1.1.1.1"; print "nameserver 1.0.0.1"}' "$RESOLV_FILE" > "$tmp" ;;
     esac
     if [ "$?" = 0 ] && atomic_write "$target" 644 < "$tmp" &&
        dns_reload "$backend" && dns_activate_stub && dns_runtime_valid "$backend" && dns_lookup_works; then
         rm -f -- "$tmp"
         print_ok "默认 DNS 配置已写入磁盘，上游检查和系统解析测试通过。"
-        print_info "DNS 列表：1.1.1.1（首选）、8.8.8.8（备选）；未重启网卡、Xray 或 3x-ui。"
+        print_info "DNS 列表：1.1.1.1（首选）、1.0.0.1（备选）；未重启网卡、Xray 或 3x-ui。"
         print_info "实际使用哪个上游由解析器决定，不保证备选只在首选超时时使用。"
         print_info "专用域路由可能继续使用内网 DNS；应用已有连接/缓存不会立即改变。"
         print_info "重启后可用选项 9 再检查，外部管理工具仍可能覆盖配置。"
@@ -1071,12 +1071,12 @@ dns_menu() {
     local choice confirm backend
     while true; do
         show_dns
-        printf '\n  1. 设置 DNS：1.1.1.1 首选 / 8.8.8.8 备选（持久化）\n  2. 恢复修改前的 DNS 配置\n  0. 返回主菜单\n'
+        printf '\n  1. 设置 DNS：1.1.1.1 首选 / 1.0.0.1 备选（持久化）\n  2. 恢复修改前的 DNS 配置\n  0. 返回主菜单\n'
         read -r -p "请选择 [0-2]: " choice || return 0
         case "$choice" in
             1)
                 backend=$(dns_backend)
-                print_warn "1.1.1.1 / 8.8.8.8 不保证更快；仅 IPv6 的 VPS 无法直接访问这些 IPv4 地址。"
+                print_warn "1.1.1.1 / 1.0.0.1 不保证更快；仅 IPv6 的 VPS 无法直接访问这些 IPv4 地址。"
                 print_info "按上述顺序配置 DNS；解析器可能在切换后继续使用备选，并非严格主备。"
                 print_warn "可能影响内网域名/VPN 分流；NetworkManager 全局 DNS 会覆盖连接级 DNS。"
                 if [ "$backend" = resolved ] && dns_uses_resolved_uplink; then
